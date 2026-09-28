@@ -119,7 +119,7 @@ def resolve_quote_meta(title: str):
     encoded = urllib.parse.quote(title)
     return {
         "maker": "公式・流通",
-        "quote_label": "商品情報カタログ",
+        "quote_label": "商品カタログ",
         "source_url": f"https://www.google.com/search?q={encoded}",
     }
 
@@ -139,14 +139,13 @@ def init_db():
             image_url TEXT,
             price TEXT,
             maker TEXT DEFAULT '公式・流通',
-            quote_label TEXT DEFAULT '商品情報カタログ',
+            quote_label TEXT DEFAULT '商品カタログ',
             source_url TEXT DEFAULT ''
         )
     """)
-  # 既存DBへの互換カラム追加
   for col, col_def in [
       ("maker", "TEXT DEFAULT '公式・流通'"),
-      ("quote_label", "TEXT DEFAULT '商品情報カタログ'"),
+      ("quote_label", "TEXT DEFAULT '商品カタログ'"),
       ("source_url", "TEXT DEFAULT ''"),
   ]:
     try:
@@ -237,10 +236,7 @@ def get_image_bytes(jan: str, target_url: str):
 
 def sync_sheet_to_local():
   if not os.path.exists(credential_path):
-    print(
-        "⚠️ credentials.json"
-        " が見つかりません。環境変数(GCP_CREDENTIALS_JSON)を確認してください。"
-    )
+    print("⚠️ credentials.json が見つかりません。")
     return
   try:
     scope = [
@@ -288,9 +284,7 @@ def sync_sheet_to_local():
 
     conn.commit()
     conn.close()
-    print(
-        f"🚀 スプレッドシートから {count} 件のデータをローカルDBへ高速同期しました！"
-    )
+    print(f"🚀 スプレッドシートから {count} 件同期完了！")
   except Exception as e:
     print(f"⚠️ スプレッドシート同期スキップ: {e}")
 
@@ -348,8 +342,8 @@ def generate_sheet(req: SheetRenderRequest):
   for fp in font_paths:
     if os.path.exists(fp):
       try:
-        font_large = ImageFont.truetype(fp, 28)
-        font_badge = ImageFont.truetype(fp, 56)
+        font_large = ImageFont.truetype(fp, 26)
+        font_badge = ImageFont.truetype(fp, 52)
         font_small = ImageFont.truetype(fp, 13)
         break
       except Exception:
@@ -360,13 +354,14 @@ def generate_sheet(req: SheetRenderRequest):
     font_badge = ImageFont.load_default()
     font_small = ImageFont.load_default()
 
-  header_text = f"📦 買取パッケージ一覧 (シート {req.page} / {req.total_pages})"
+  # 文字化け防止のため絵文字を排除したヘッダー文字列
+  header_text = f"買取パッケージ一覧 (シート {req.page} / {req.total_pages})"
   draw.text((40, 40), header_text, fill=(0, 255, 204), font=font_large)
 
   cols = 3
-  startX, startY = 40, 100
-  cellW, cellH = 260, 290
-  gapX, gapY = 30, 30
+  startX, startY = 40, 95
+  cellW, cellH = 260, 305
+  gapX, gapY = 30, 25
 
   for index, item in enumerate(req.items):
     col = index % cols
@@ -381,25 +376,21 @@ def generate_sheet(req: SheetRenderRequest):
       try:
         tile = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
         tile_w, tile_h = tile.size
-        scale = max(cellW / tile_w, cellH / tile_h)
+        # 画像エリアを上部に確保 (高さ cellH - 30px)
+        img_area_h = cellH - 35
+        scale = max(cellW / tile_w, img_area_h / tile_h)
         nw, nh = int(tile_w * scale), int(tile_h * scale)
         tile = tile.resize((nw, nh), Image.Resampling.BILINEAR)
 
         crop_x = (nw - cellW) // 2
-        crop_y = (nh - cellH) // 2
-        tile = tile.crop((crop_x, crop_y, crop_x + cellW, crop_y + cellH))
+        crop_y = (nh - img_area_h) // 2
+        tile = tile.crop((crop_x, crop_y, crop_x + cellW, crop_y + img_area_h))
         img_out.paste(tile, (x, y))
       except Exception as e:
         print(f"  └ ⚠️ タイル合成エラー: {e}")
     else:
       draw.text(
-          (x + 75, y + 100), "No Image", fill=(255, 204, 0), font=font_large
-      )
-      title_display = (
-          item.title[:14] + "..." if len(item.title) > 14 else item.title
-      )
-      draw.text(
-          (x + 15, y + 150), title_display, fill=(255, 255, 255), font=font_small
+          (x + 80, y + 100), "No Image", fill=(255, 204, 0), font=font_large
       )
 
     draw.rectangle([x, y, x + cellW, y + cellH], outline=(80, 80, 80), width=2)
@@ -408,31 +399,31 @@ def generate_sheet(req: SheetRenderRequest):
     badge = f"{item.count}個"
     draw.rectangle(
         [
-            x + cellW // 2 - 60,
-            y + cellH // 2 - 35,
-            x + cellW // 2 + 60,
-            y + cellH // 2 + 35,
+            x + cellW // 2 - 55,
+            y + (cellH - 35) // 2 - 25,
+            x + cellW // 2 + 55,
+            y + (cellH - 35) // 2 + 25,
         ],
         fill=(0, 0, 0, 180),
     )
     draw.text(
-        (x + cellW // 2 - 45, y + cellH // 2 - 30),
+        (x + cellW // 2 - 40, y + (cellH - 35) // 2 - 22),
         badge,
         fill=(0, 255, 102),
         font=font_badge,
     )
 
-    # 枠下部に出所引用表示（控えめに記載）
-    if item.quote_label:
-      draw.rectangle(
-          [(x, y + cellH - 22), (x + cellW, y + cellH)], fill=(0, 0, 0, 190)
-      )
-      draw.text(
-          (x + 8, y + cellH - 18),
-          f"出所: {item.quote_label}",
-          fill=(180, 180, 180),
-          font=font_small,
-      )
+    # 最下部に引用元を明記
+    label = item.quote_label if item.quote_label else "公式カタログ"
+    draw.rectangle(
+        [(x, y + cellH - 32), (x + cellW, y + cellH)], fill=(15, 23, 42)
+    )
+    draw.text(
+        (x + 12, y + cellH - 26),
+        f"出所: {label}",
+        fill=(148, 163, 184),
+        font=font_small,
+    )
 
   buf = io.BytesIO()
   img_out.save(buf, format="PNG")
@@ -442,7 +433,7 @@ def generate_sheet(req: SheetRenderRequest):
 
 
 # ==========================================
-# 3. 画面UI（元のデザイン・操作性を維持）
+# 3. 画面UI
 # ==========================================
 
 
@@ -476,7 +467,7 @@ def get_scanner_page():
             .item-info { flex-grow: 1; overflow: hidden; }
             .item-title { color: #eee; line-height: 1.4; font-weight: bold; }
             .item-jan { color: #888; font-size: 11px; margin-top: 2px; }
-            .item-quote { font-size: 10px; color: #666; margin-top: 2px; }
+            .item-quote { font-size: 10px; color: #38bdf8; margin-top: 2px; }
             .item-quote a { color: #38bdf8; text-decoration: none; }
             
             .qty-control { display: flex; align-items: center; white-space: nowrap; flex-shrink: 0; }
@@ -504,7 +495,6 @@ def get_scanner_page():
         <button id="scan-toggle-btn" class="btn-toggle" onclick="toggleScanner()">📷 カメラを起動する</button>
         <div id="reader-container"><div id="interactive" style="width: 100%;"></div></div>
 
-        <!-- スキャン結果バナー -->
         <div id="result-banner" class="result-banner">
             <div class="banner-content">
                 <div class="banner-item">
@@ -512,7 +502,7 @@ def get_scanner_page():
                     <div style="overflow: hidden;">
                         <div id="res-title" style="font-weight: bold; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; max-width: 190px;"></div>
                         <div id="res-jan" style="color: #aaa; font-size: 11px; margin-top: 2px;"></div>
-                        <div id="res-quote" style="font-size: 10px; color: #94a3b8; margin-top: 1px;"></div>
+                        <div id="res-quote" style="font-size: 10px; color: #38bdf8; margin-top: 1px;"></div>
                     </div>
                 </div>
                 <div class="banner-qty-controls">
@@ -529,9 +519,7 @@ def get_scanner_page():
                 <div>登録点数: <strong id="total-items" style="color:#00ffcc; font-size:18px;">0</strong> 点</div>
                 <button class="btn-clear" onclick="clearCart()">🗑️ リストを空にする</button>
             </div>
-            <h3>
-                <span>📋 持込買取リスト</span>
-            </h3>
+            <h3><span>📋 持込買取リスト</span></h3>
             <div id="cart-items"><p style="color: #777; text-align: center; margin: 8px 0;">まだ商品は追加されていません</p></div>
             <button class="btn btn-export" onclick="exportList()">📋 テキストリストをコピーする</button>
             <button class="btn btn-image" onclick="generatePreviewsServer()">🖼️ パッケージ写真プレビュー生成</button>
@@ -547,7 +535,6 @@ def get_scanner_page():
             let html5QrCode = null;
             let isScanning = false;
             let currentBannerJan = "";
-
             let lastScannedCode = "";
             let lastScanTime = 0;
 
@@ -610,7 +597,6 @@ def get_scanner_page():
 
             async function onScanSuccess(decodedText) {
                 const now = Date.now();
-
                 if (decodedText === lastScannedCode && (now - lastScanTime) < 3000) return;
                 if ((now - lastScanTime) < 1200) return;
 
@@ -626,7 +612,7 @@ def get_scanner_page():
                     });
                     
                     if (!res.ok) {
-                        document.getElementById("error-msg").innerText = "未対応コード/短縮コード無効: " + decodedText;
+                        document.getElementById("error-msg").innerText = "未対応コード: " + decodedText;
                         return;
                     }
 
@@ -642,7 +628,7 @@ def get_scanner_page():
                             title: data.title || "", 
                             imageUrl: data.image_url || "", 
                             count: 1,
-                            quote_label: data.quote_label || "公式引用",
+                            quote_label: data.quote_label || "公式カタログ",
                             source_url: data.source_url || "#"
                         };
                     }
@@ -658,7 +644,7 @@ def get_scanner_page():
 
                     if (navigator.vibrate) navigator.vibrate(50);
                 } catch (e) {
-                    document.getElementById("error-msg").innerText = "通信エラーが発生しました";
+                    document.getElementById("error-msg").innerText = "通信エラー";
                 }
             }
 
@@ -711,7 +697,7 @@ def get_scanner_page():
                         <div class="item-info">
                             <div class="item-title">${item.title}</div>
                             <div class="item-jan">コード: ${item.jan}</div>
-                            <div class="item-quote">出所: <a href="${item.source_url || '#'}" target="_blank" rel="noopener">${item.quote_label || '公式出所'}</a></div>
+                            <div class="item-quote">出所: <a href="${item.source_url || '#'}" target="_blank" rel="noopener">${item.quote_label || '公式カタログ'}</a></div>
                         </div>
                         <div class="qty-control">
                             <button class="qty-btn" onclick="changeQty('${code}', -1)">-</button>
@@ -735,7 +721,7 @@ def get_scanner_page():
                     text += `- ${item.title} : ${item.count}個 [JAN: ${item.jan}]\\n`;
                 });
                 text += `\\n合計点数: ${totalItems}点\\n`;
-                navigator.clipboard.writeText(text).then(() => alert("持込リスト（点数一覧）をコピーしました！"));
+                navigator.clipboard.writeText(text).then(() => alert("持込リストをコピーしました！"));
             }
 
             async function generatePreviewsServer() {
@@ -756,8 +742,8 @@ def get_scanner_page():
                             title: String(item.title || ""),
                             count: parseInt(item.count) || 1,
                             image_url: String(img),
-                            quote_label: String(item.quote_label || ""),
-                            source_url: String(item.source_url || "")
+                            quote_label: String(item.quote_label || "公式カタログ"),
+                            source_url: String(item.source_url || "#")
                         };
                     });
 
@@ -793,7 +779,7 @@ def get_scanner_page():
                     }
                 } catch (e) {
                     console.error("プレビュー生成例外:", e);
-                    container.innerHTML = `<p style='color:#ff6b6b;'>プレビュー生成に失敗しました: ${e.message}</p>`;
+                    container.innerHTML = `<p style='color:#ff6b6b;'>プレビュー生成に失敗: ${e.message}</p>`;
                     alert("プレビュー生成エラー: " + e.message);
                 }
             }
@@ -802,11 +788,6 @@ def get_scanner_page():
     </html>
     """
   return html_content
-
-
-# ==========================================
-# 4. スキャン照合エンドポイント（引用メタデータを注入）
-# ==========================================
 
 
 @app.post("/process_jan")
@@ -849,7 +830,6 @@ def process_jan_code(data: ScanRequest):
     )
     existing_image = row[2] if (row and row[2] and row[2].strip()) else ""
 
-    # DBに引用メタデータがあれば使用、無ければタイトルから即時推測
     if row and row[5]:
       quote_label = row[5]
       source_url = row[6]
@@ -858,7 +838,6 @@ def process_jan_code(data: ScanRequest):
       quote_label = meta["quote_label"]
       source_url = meta["source_url"]
 
-    print(f"📥 [スキャン即答] JAN: {cleanText} -> {quote_label}")
     return {
         "source": "sqlite_cache" if row else "unregistered",
         "jan": cleanText,
