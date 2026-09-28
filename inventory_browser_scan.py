@@ -7,8 +7,6 @@ import urllib.parse
 from fastapi import FastAPI, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 from PIL import Image, ImageDraw, ImageFont
 import requests
 
@@ -23,13 +21,9 @@ app.add_middleware(
 )
 
 DB_PATH = "inventory.db"
-SPREADSHEET_KEY = os.environ.get(
-    "SPREADSHEET_KEY", "1_s-4E1lU1r7y7K9RzX4Y0q8T2v9V0W1X2Y3Z4A5B6C"
-)
-CREDS_FILE = "service_account.json"
 
 # ==========================================
-# 1. データベース初期化＆引用メタデータ拡張
+# 1. データベース初期化
 # ==========================================
 
 
@@ -43,27 +37,14 @@ def init_db():
             price INTEGER DEFAULT 0,
             image_url TEXT,
             maker TEXT DEFAULT '公式・流通',
-            quote_label TEXT DEFAULT '商品情報詳細',
+            quote_label TEXT DEFAULT '公式出所',
             source_url TEXT DEFAULT '',
             custom_image BLOB,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-  # 既存DBへのカラム追加互換性
-  for col, col_type in [
-      ("maker", "TEXT DEFAULT '公式・流通'"),
-      ("quote_label", "TEXT DEFAULT '商品情報詳細'"),
-      ("source_url", "TEXT DEFAULT ''"),
-      ("custom_image", "BLOB"),
-  ]:
-    try:
-      cursor.execute(f"ALTER TABLE items ADD COLUMN {col} {col_type}")
-    except sqlite3.OperationalError:
-      pass
-
-  cursor.execute(
-      "CREATE INDEX IF NOT EXISTS idx_items_title ON items (title)"
-  )
+  cursor.execute("CREATE INDEX IF NOT EXISTS idx_items_jan ON items (jan)")
+  cursor.execute("CREATE INDEX IF NOT EXISTS idx_items_title ON items (title)")
   conn.commit()
   conn.close()
 
@@ -76,9 +57,7 @@ init_db()
 
 
 def resolve_quote_meta(title: str):
-  """商品名から主要メーカーを推測し、正当な出所明示用の引用先URLとラベルを生成"""
   t = title.lower()
-
   if any(
       k in t
       for k in [
@@ -92,7 +71,6 @@ def resolve_quote_meta(title: str):
           "solid and souls",
           "dxf",
           "fluffy puffy",
-          "world collectable",
           "wcf",
           "masterlise",
       ]
@@ -102,7 +80,6 @@ def resolve_quote_meta(title: str):
         "quote_label": "バンプレナビ (公式引用)",
         "source_url": "https://bsp-prize.jp/",
     }
-
   if any(
       k in t
       for k in [
@@ -121,7 +98,6 @@ def resolve_quote_meta(title: str):
         "quote_label": "セガプラザ (公式引用)",
         "source_url": "https://segaplaza.jp/",
     }
-
   if any(
       k in t
       for k in [
@@ -139,7 +115,6 @@ def resolve_quote_meta(title: str):
         "quote_label": "タイトープライズ (公式引用)",
         "source_url": "https://www.taito.co.jp/taito-prize",
     }
-
   if any(
       k in t
       for k in [
@@ -167,107 +142,88 @@ def resolve_quote_meta(title: str):
 
 
 # ==========================================
-# 3. スプレッドシート高速同期
+# 3. 外部フォールバック検索（DB未登録時の自動スクレイピング救済）
 # ==========================================
 
 
-@app.on_event("startup")
-def sync_spreadsheet_data():
-  if not os.path.exists(CREDS_FILE):
-    print(f"⚠️ {CREDS_FILE} が見つからないため同期をスキップします。")
-    return
-
+def fetch_external_fallback(code: str):
+  """DBにない未登録コードがスキャンされた際、外部プライズDB（Neatzanime等）から即座にタイトル・画像を取得"""
   try:
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, scope)
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(SPREADSHEET_KEY).sheet1
-    all_values = sheet.get_all_values()
-
-    if not all_values or len(all_values) <= 1:
-      return
-
-    header = all_values[0]
-    col_map = {col: i for i, col in enumerate(header)}
-
-    jan_col = col_map.get("JAN") or col_map.get("コード") or 0
-    name_col = col_map.get("商品名") or col_map.get("タイトル") or 1
-    price_col = col_map.get("買取価格") or col_map.get("価格") or 2
-    img_col = col_map.get("画像URL") or col_map.get("画像") or 3
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    records = []
-    for row in all_values[1:]:
-      if len(row) <= jan_col:
-        continue
-      raw_jan = str(row[jan_col]).strip()
-      if not raw_jan:
-        continue
-
-      title = str(row[name_col]).strip() if len(row) > name_col else "名称不明"
-      raw_price = (
-          re.sub(r"[^\d]", "", str(row[price_col]))
-          if len(row) > price_col
-          else "0"
+    url = f"https://neatzanime.com/search?q={code}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        )
+    }
+    res = requests.get(url, headers=headers, timeout=4.0)
+    if res.status_code == 200:
+      # HTMLから簡易正規表現でタイトルと画像を抽出
+      title_match = re.search(r'<h3 class="product-title">(.*?)</h3>', res.text)
+      img_match = re.search(
+          r'<img[^>]+class="product-image"[^>]+src="([^">]+)"', res.text
       )
-      price = int(raw_price) if raw_price else 0
-      img_url = str(row[img_col]).strip() if len(row) > img_col else ""
 
-      meta = resolve_quote_meta(title)
-      records.append((
-          raw_jan,
-          title,
-          price,
-          img_url,
-          meta["maker"],
-          meta["quote_label"],
-          meta["source_url"],
-      ))
+      if title_match:
+        title = title_match.group(1).strip()
+        img_url = img_match.group(1).strip() if img_match else ""
+        meta = resolve_quote_meta(title)
 
-    cursor.executemany(
-        """
-            INSERT INTO items (jan, title, price, image_url, maker, quote_label, source_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(jan) DO UPDATE SET
-                title=excluded.title,
-                price=excluded.price,
-                image_url=excluded.image_url,
-                maker=excluded.maker,
-                quote_label=excluded.quote_label,
-                source_url=excluded.source_url
-        """,
-        records,
-    )
-    conn.commit()
-    conn.close()
-    print(
-        f"🚀 スプレッドシートから {len(records)} 件のデータをローカルDBへ高速同期しました！"
-    )
+        # 取得できたデータを即座にローカルDBへキャッシュ登録
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            """
+                    INSERT INTO items (jan, title, price, image_url, maker, quote_label, source_url)
+                    VALUES (?, ?, 0, ?, ?, ?, ?)
+                    ON CONFLICT(jan) DO UPDATE SET title=excluded.title, image_url=excluded.image_url
+                """,
+            (
+                code,
+                title,
+                img_url,
+                meta["maker"],
+                meta["quote_label"],
+                meta["source_url"],
+            ),
+        )
+        conn.commit()
+        conn.close()
 
+        return {
+            "jan": code,
+            "title": title,
+            "price": 0,
+            "image_url": (
+                f"/api/image-proxy?url={urllib.parse.quote(img_url)}"
+                if img_url
+                else ""
+            ),
+            "maker": meta["maker"],
+            "quote_label": meta["quote_label"],
+            "source_url": meta["source_url"],
+            "has_custom": False,
+        }
   except Exception as e:
-    print(f"⚠️ スプレッドシート同期エラー: {e}")
+    print(f"Fallback scrape error: {e}")
+
+  return None
 
 
 # ==========================================
-# 4. APIエンドポイント群
+# 4. APIエンドポイント
 # ==========================================
 
 
 @app.get("/api/lookup")
 def api_lookup(code: str = Query(...)):
-  """JAN/JAIAコードから商品情報および引用リンクメタデータを返却"""
   clean_code = re.sub(r"[^\w]", "", code)
   conn = sqlite3.connect(DB_PATH)
   cursor = conn.cursor()
 
+  # 1. 完全一致
   cursor.execute(
       """
-        SELECT jan, title, price, image_url, maker, quote_label, source_url, 
+        SELECT jan, title, price, image_url, maker, quote_label, source_url,
                CASE WHEN custom_image IS NOT NULL THEN 1 ELSE 0 END as has_custom
         FROM items WHERE jan = ?
     """,
@@ -275,15 +231,15 @@ def api_lookup(code: str = Query(...)):
   )
   row = cursor.fetchone()
 
-  # 前方一致・部分一致（18桁JAIAと13桁JANの補正）
-  if not row and len(clean_code) >= 8:
+  # 2. 前方/後方/部分一致（JAIAコードや余分なプレフィックス対策）
+  if not row and len(clean_code) >= 6:
     cursor.execute(
         """
             SELECT jan, title, price, image_url, maker, quote_label, source_url,
                    CASE WHEN custom_image IS NOT NULL THEN 1 ELSE 0 END as has_custom
-            FROM items WHERE jan LIKE ? LIMIT 1
+            FROM items WHERE jan LIKE ? OR ? LIKE '%' || jan || '%' LIMIT 1
         """,
-        (f"%{clean_code}%",),
+        (f"%{clean_code}%", clean_code),
     )
     row = cursor.fetchone()
 
@@ -309,13 +265,19 @@ def api_lookup(code: str = Query(...)):
             "title": row[1],
             "price": row[2],
             "image_url": display_img,
-            "maker": row[4],
-            "quote_label": row[5],
-            "source_url": row[6],
+            "maker": row[4] or "公式流通",
+            "quote_label": row[5] or "公式引用",
+            "source_url": row[6] or "#",
             "has_custom": has_custom,
         },
     }
 
+  # 3. DBに無ければ外部スクレイピング救済を試行
+  fallback_result = fetch_external_fallback(clean_code)
+  if fallback_result:
+    return {"status": "success", "found": True, "data": fallback_result}
+
+  # 4. それでもヒットしない場合
   return {
       "status": "success",
       "found": False,
@@ -326,7 +288,7 @@ def api_lookup(code: str = Query(...)):
           "image_url": "",
           "maker": "不明",
           "quote_label": "手動登録",
-          "source_url": "",
+          "source_url": "#",
           "has_custom": False,
       },
   }
@@ -334,15 +296,11 @@ def api_lookup(code: str = Query(...)):
 
 @app.post("/api/upload-photo")
 async def api_upload_photo(request: Request):
-  """現場で撮影した実物パッケージ写真を特定JANに紐付けてローカル保存"""
   data = await request.json()
   jan = data.get("jan")
   image_base64 = data.get("image_base64")
-
   if not jan or not image_base64:
-    return JSONResponse(
-        status_code=400, content={"error": "パラメータ不足です"}
-    )
+    return JSONResponse(status_code=400, content={"error": "パラメータ不足"})
 
   if "," in image_base64:
     image_base64 = image_base64.split(",", 1)[1]
@@ -362,7 +320,6 @@ async def api_upload_photo(request: Request):
   )
   conn.commit()
   conn.close()
-
   return {"status": "success", "image_url": f"/api/custom-image?jan={jan}"}
 
 
@@ -373,7 +330,6 @@ def get_custom_image(jan: str):
   cursor.execute("SELECT custom_image FROM items WHERE jan = ?", (jan,))
   row = cursor.fetchone()
   conn.close()
-
   if row and row[0]:
     return Response(content=row[0], media_type="image/jpeg")
   return Response(status_code=404)
@@ -381,7 +337,6 @@ def get_custom_image(jan: str):
 
 @app.get("/api/image-proxy")
 def image_proxy(url: str):
-  """参照元サーバーの負荷を抑え、安全に中継キャッシュするエンドポイント"""
   if not url:
     return Response(status_code=404)
   try:
@@ -400,7 +355,7 @@ def image_proxy(url: str):
 
 
 # ==========================================
-# 5. パッケージ画像付き持込照合シート生成
+# 5. 持込照合シート生成
 # ==========================================
 
 
@@ -422,10 +377,8 @@ def load_font(size):
 
 @app.post("/api/generate-sheet")
 async def generate_sheet(request: Request):
-  """スキャン済み商品リストから、店員照合用のパッケージ付き画像一覧PNGを生成"""
   data = await request.json()
-  items = data.get("items", [])  # [{"jan": ..., "qty": ...}]
-
+  items = data.get("items", [])
   if not items:
     return JSONResponse(status_code=400, content={"error": "リストが空です"})
 
@@ -481,7 +434,6 @@ async def generate_sheet(request: Request):
     quote_label = db_item[3] if db_item else "引用情報なし"
     custom_img_bytes = db_item[4] if db_item else None
 
-    # 画像取得（現場撮影優先 -> キャッシュプロキシ）
     img_obj = None
     if custom_img_bytes:
       try:
@@ -510,12 +462,10 @@ async def generate_sheet(request: Request):
           (x + 70, y + 140), "NO IMAGE", font=font_name, fill="#94A3B8"
       )
 
-    # 数量バッジ
     qty = item_data.get("qty", 1)
     draw.rectangle([(x + 20, y + 20), (x + 110, y + 65)], fill="#EF4444")
     draw.text((x + 30, y + 26), f"{qty} 個", font=font_badge, fill="#FFFFFF")
 
-    # タイトル（2行折り返し）
     t_short = title[:34] + ("..." if len(title) > 34 else "")
     draw.text((x + 20, y + cell_h - 130), t_short[:17], font=font_name, fill="#1E293B")
     if len(t_short) > 17:
@@ -523,7 +473,6 @@ async def generate_sheet(request: Request):
           (x + 20, y + cell_h - 105), t_short[17:], font=font_name, fill="#1E293B"
       )
 
-    # 引用元表記（法的防壁の出所明示）
     draw.text(
         (x + 20, y + cell_h - 60),
         f"コード: {item_data['jan']}",
@@ -545,7 +494,7 @@ async def generate_sheet(request: Request):
 
 
 # ==========================================
-# 6. モバイル特化フロントエンドUI
+# 6. モバイルUI
 # ==========================================
 
 
@@ -591,13 +540,11 @@ def index_view():
     .btn-sheet { background: #0284C7; color: #FFF; }
     .btn-clear { background: #334155; color: #94A3B8; flex: 0.3; }
 
-    /* カメラ撮影モーダル */
     #photo-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; flex-direction: column; align-items: center; justify-content: center; padding: 20px; }
     #modal-video { width: 100%; max-width: 360px; height: 360px; object-fit: cover; border-radius: 12px; }
   </style>
 </head>
 <body>
-
   <header>
     <h1>📦 査定・持込スキャナー</h1>
     <span class="badge" id="box-label">BOX: MAIN</span>
@@ -621,7 +568,6 @@ def index_view():
     <button class="btn btn-sheet" onclick="requestSheet()">🖼️ 照合用画像シート生成</button>
   </div>
 
-  <!-- 写真撮影用フォールバックモーダル -->
   <div id="photo-modal">
     <h3 style="margin-top:0;font-size:16px;">📸 実物パッケージを撮影</h3>
     <video id="modal-video" playsinline></video>
@@ -636,13 +582,12 @@ def index_view():
     const boxId = urlParams.get('box') || 'main';
     document.getElementById('box-label').innerText = 'BOX: ' + boxId.toUpperCase();
 
-    let scannedItems = {}; // { jan: { qty, title, price, image_url, quote_label, source_url } }
+    let scannedItems = {};
     let lastCode = '';
     let lastScanTime = 0;
     let codeReader = null;
     let currentPhotoJan = null;
 
-    // ZXing バーコードスキャナー起動
     async function startScanner() {
       try {
         codeReader = new ZXing.BrowserMultiFormatReader();
@@ -653,7 +598,7 @@ def index_view():
           if (result) {
             const now = Date.now();
             const text = result.getText();
-            if (text === lastCode && (now - lastScanTime) < 1800) return; // デバウンス
+            if (text === lastCode && (now - lastScanTime) < 1800) return;
             lastCode = text;
             lastScanTime = now;
             handleScanned(text);
@@ -673,7 +618,6 @@ def index_view():
         return;
       }
 
-      // API照合
       try {
         const res = await fetch(`/api/lookup?code=${encodeURIComponent(code)}`);
         const json = await res.json();
@@ -684,7 +628,7 @@ def index_view():
           title: d.title,
           price: d.price || 0,
           image_url: d.image_url || '',
-          quote_label: d.quote_label || '公式出所',
+          quote_label: d.quote_label || '公式引用',
           source_url: d.source_url || '#'
         };
         updateUI();
@@ -715,7 +659,7 @@ def index_view():
           <div class="card-info">
             <div class="card-title">${item.title}</div>
             <div class="card-meta">コード: ${jan} | 目安: ¥${item.price.toLocaleString()}</div>
-            <div class="card-quote">引用: <a href="${item.source_url}" target="_blank" rel="noopener">${item.quote_label}</a></div>
+            <div class="card-quote">出所: <a href="${item.source_url}" target="_blank" rel="noopener">${item.quote_label}</a></div>
           </div>
           <div class="card-qty">${item.qty}</div>
         `;
@@ -762,7 +706,6 @@ def index_view():
       }
     }
 
-    // 未登録・画像抜け対策の現場カメラ撮影
     let modalStream = null;
     async function openPhotoModal(jan) {
       currentPhotoJan = jan;
@@ -789,7 +732,6 @@ def index_view():
 
       closePhotoModal();
       
-      // バックエンドへ送信・保存
       const res = await fetch('/api/upload-photo', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
