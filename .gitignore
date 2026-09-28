@@ -1,3 +1,5 @@
-﻿credentials.json
+﻿__pycache__/
 inventory.db
-__pycache__/
+img_cache/
+credentials.json
+.env
