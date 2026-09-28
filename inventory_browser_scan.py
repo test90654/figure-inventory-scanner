@@ -28,7 +28,6 @@ db_path = os.path.join(base_dir, "inventory.db")
 img_cache_dir = os.path.join(base_dir, "img_cache")
 os.makedirs(img_cache_dir, exist_ok=True)
 
-# クラウド用: 環境変数 GCP_CREDENTIALS_JSON があれば credentials.json を自動生成
 if not os.path.exists(credential_path):
   gcp_json_env = os.environ.get("GCP_CREDENTIALS_JSON")
   if gcp_json_env:
@@ -36,7 +35,7 @@ if not os.path.exists(credential_path):
       f.write(gcp_json_env)
 
 # ==========================================
-# 1. 引用元（テイ）の自動判定ロジック
+# 1. 引用元（テイ）の自動判定ロジック（メーカー名＋カタログ名）
 # ==========================================
 
 
@@ -61,7 +60,7 @@ def resolve_quote_meta(title: str):
   ):
     return {
         "maker": "BANDAI SPIRITS",
-        "quote_label": "バンプレナビ",
+        "quote_label": "バンプレスト / バンプレナビ",
         "source_url": "https://bsp-prize.jp/",
     }
   elif any(
@@ -78,7 +77,7 @@ def resolve_quote_meta(title: str):
   ):
     return {
         "maker": "SEGA",
-        "quote_label": "セガプラザ",
+        "quote_label": "セガ / セガプラザ",
         "source_url": "https://segaplaza.jp/",
     }
   elif any(
@@ -95,7 +94,7 @@ def resolve_quote_meta(title: str):
   ):
     return {
         "maker": "タイトー",
-        "quote_label": "タイトープライズ",
+        "quote_label": "タイトー / タイトープライズ",
         "source_url": "https://www.taito.co.jp/taito-prize",
     }
   elif any(
@@ -112,20 +111,20 @@ def resolve_quote_meta(title: str):
   ):
     return {
         "maker": "フリュー",
-        "quote_label": "キャラ広場",
+        "quote_label": "フリュー / キャラ広場",
         "source_url": "https://charahiroba.com/prize/",
     }
   else:
     encoded = urllib.parse.quote(title)
     return {
         "maker": "公式・流通",
-        "quote_label": "商品カタログ",
+        "quote_label": "流通 / 商品カタログ",
         "source_url": f"https://www.google.com/search?q={encoded}",
     }
 
 
 # ==========================================
-# 2. DB初期化（安全なカラム自動追加）
+# 2. DB初期化
 # ==========================================
 
 
@@ -139,13 +138,13 @@ def init_db():
             image_url TEXT,
             price TEXT,
             maker TEXT DEFAULT '公式・流通',
-            quote_label TEXT DEFAULT '商品カタログ',
+            quote_label TEXT DEFAULT '流通 / 商品カタログ',
             source_url TEXT DEFAULT ''
         )
     """)
   for col, col_def in [
       ("maker", "TEXT DEFAULT '公式・流通'"),
-      ("quote_label", "TEXT DEFAULT '商品カタログ'"),
+      ("quote_label", "TEXT DEFAULT '流通 / 商品カタログ'"),
       ("source_url", "TEXT DEFAULT ''"),
   ]:
     try:
@@ -344,7 +343,7 @@ def generate_sheet(req: SheetRenderRequest):
       try:
         font_large = ImageFont.truetype(fp, 26)
         font_badge = ImageFont.truetype(fp, 52)
-        font_small = ImageFont.truetype(fp, 13)
+        font_small = ImageFont.truetype(fp, 12)
         break
       except Exception:
         continue
@@ -354,7 +353,6 @@ def generate_sheet(req: SheetRenderRequest):
     font_badge = ImageFont.load_default()
     font_small = ImageFont.load_default()
 
-  # 文字化け防止のため絵文字を排除したヘッダー文字列
   header_text = f"買取パッケージ一覧 (シート {req.page} / {req.total_pages})"
   draw.text((40, 40), header_text, fill=(0, 255, 204), font=font_large)
 
@@ -376,7 +374,6 @@ def generate_sheet(req: SheetRenderRequest):
       try:
         tile = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
         tile_w, tile_h = tile.size
-        # 画像エリアを上部に確保 (高さ cellH - 30px)
         img_area_h = cellH - 35
         scale = max(cellW / tile_w, img_area_h / tile_h)
         nw, nh = int(tile_w * scale), int(tile_h * scale)
@@ -395,7 +392,6 @@ def generate_sheet(req: SheetRenderRequest):
 
     draw.rectangle([x, y, x + cellW, y + cellH], outline=(80, 80, 80), width=2)
 
-    # 数量バッジ
     badge = f"{item.count}個"
     draw.rectangle(
         [
@@ -413,13 +409,12 @@ def generate_sheet(req: SheetRenderRequest):
         font=font_badge,
     )
 
-    # 最下部に引用元を明記
-    label = item.quote_label if item.quote_label else "公式カタログ"
+    label = item.quote_label if item.quote_label else "流通 / 商品カタログ"
     draw.rectangle(
         [(x, y + cellH - 32), (x + cellW, y + cellH)], fill=(15, 23, 42)
     )
     draw.text(
-        (x + 12, y + cellH - 26),
+        (x + 10, y + cellH - 26),
         f"出所: {label}",
         fill=(148, 163, 184),
         font=font_small,
@@ -628,7 +623,7 @@ def get_scanner_page():
                             title: data.title || "", 
                             imageUrl: data.image_url || "", 
                             count: 1,
-                            quote_label: data.quote_label || "公式カタログ",
+                            quote_label: data.quote_label || "流通 / 商品カタログ",
                             source_url: data.source_url || "#"
                         };
                     }
@@ -697,7 +692,7 @@ def get_scanner_page():
                         <div class="item-info">
                             <div class="item-title">${item.title}</div>
                             <div class="item-jan">コード: ${item.jan}</div>
-                            <div class="item-quote">出所: <a href="${item.source_url || '#'}" target="_blank" rel="noopener">${item.quote_label || '公式カタログ'}</a></div>
+                            <div class="item-quote">出所: <a href="${item.source_url || '#'}" target="_blank" rel="noopener">${item.quote_label || '流通 / 商品カタログ'}</a></div>
                         </div>
                         <div class="qty-control">
                             <button class="qty-btn" onclick="changeQty('${code}', -1)">-</button>
@@ -742,7 +737,7 @@ def get_scanner_page():
                             title: String(item.title || ""),
                             count: parseInt(item.count) || 1,
                             image_url: String(img),
-                            quote_label: String(item.quote_label || "公式カタログ"),
+                            quote_label: String(item.quote_label || "流通 / 商品カタログ"),
                             source_url: String(item.source_url || "#")
                         };
                     });
