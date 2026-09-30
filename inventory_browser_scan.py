@@ -2,6 +2,7 @@ import io
 import json
 import os
 import sqlite3
+import traceback
 import urllib.parse
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
@@ -12,6 +13,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel
 import requests
+from playwright.sync_api import sync_playwright
 
 app = FastAPI(title="Figure Inventory Cloud Edition")
 
@@ -35,7 +37,7 @@ if not os.path.exists(credential_path):
       f.write(gcp_json_env)
 
 # ==========================================
-# 1. 引用元（テイ）の自動判定ロジック（メーカー名＋カタログ名）
+# 1. 引用元（テイ）の自動判定ロジック[cite: 1]
 # ==========================================
 
 
@@ -124,7 +126,7 @@ def resolve_quote_meta(title: str):
 
 
 # ==========================================
-# 2. DB初期化
+# 2. DB初期化[cite: 1]
 # ==========================================
 
 
@@ -319,19 +321,89 @@ class SheetRenderRequest(BaseModel):
   total_pages: int
 
 
+class BulkAddRequest(BaseModel):
+  jans: list[str]
+
+
+@app.post("/api/bulk_add_box")
+def bulk_add_box(data: BulkAddRequest):
+  results = []
+  try:
+    with sync_playwright() as p:
+      # 💡 headless=True に戻して裏でスマートに実行
+      browser = p.chromium.launch(
+          headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"]
+      )
+      context = browser.new_context(
+          user_agent=(
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+              " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          )
+      )
+      page = context.new_page()
+
+      page.goto("https://shop.lashinbang.com/kaitori/offer", timeout=15000)
+      page.wait_for_timeout(2000)
+
+      for jan in data.jans:
+        jan = jan.strip()
+        if not jan:
+          continue
+
+        try:
+          search_url = f"https://shop.lashinbang.com/kaitori/list?jan={jan}"
+          page.goto(search_url, timeout=10000)
+
+          page.wait_for_selector("li[data-product-id]", timeout=5000)
+
+          product_id = page.eval_on_selector(
+              "li[data-product-id]", "el => el.getAttribute('data-product-id')"
+          )
+
+          if not product_id:
+            results.append({"jan": jan, "status": "not_found"})
+            continue
+
+          add_btn = page.query_selector("a.item_add_cart_btn")
+          if add_btn:
+            add_btn.click()
+            page.wait_for_timeout(1500)
+
+            close_popup_btn = page.query_selector(
+                "#addCartOK button.modalClose, .modal_addCart_offer_button"
+                " button.modalClose"
+            )
+            if close_popup_btn:
+              close_popup_btn.click()
+              page.wait_for_timeout(1000)
+
+            results.append({"jan": jan, "status": "success", "id": product_id})
+          else:
+            results.append(
+                {"jan": jan, "status": "button_not_found", "id": product_id}
+            )
+
+        except Exception as e:
+          print(f"Error processing JAN {jan}: {str(e)}")
+          results.append({"jan": jan, "status": "error", "message": str(e)})
+
+        page.wait_for_timeout(1000)
+
+      browser.close()
+  except Exception as e:
+    traceback.print_exc()
+    raise HTTPException(status_code=500, detail=str(e))
+
+  return {"status": "completed", "results": results}
+
+
 @app.post("/generate_sheet")
 def generate_sheet(req: SheetRenderRequest):
-  print(
-      f"\n🎨 [サーバー画像生成] シート {req.page}/{req.total_pages} (商品数:"
-      f" {len(req.items)}件)"
-  )
   canvas_w, canvas_h = 900, 1100
   img_out = Image.new("RGB", (canvas_w, canvas_h), color=(30, 30, 30))
   draw = ImageDraw.Draw(img_out)
 
-  font_large = None
-  font_badge = None
-  font_small = None
+  font_large, font_badge, font_small = None, None, None
   font_paths = [
       "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
       "/usr/share/fonts/truetype/ipafont-gothic/ipag.ttf",
@@ -383,8 +455,8 @@ def generate_sheet(req: SheetRenderRequest):
         crop_y = (nh - img_area_h) // 2
         tile = tile.crop((crop_x, crop_y, crop_x + cellW, crop_y + img_area_h))
         img_out.paste(tile, (x, y))
-      except Exception as e:
-        print(f"  └ ⚠️ タイル合成エラー: {e}")
+      except Exception:
+        pass
     else:
       draw.text(
           (x + 80, y + 100), "No Image", fill=(255, 204, 0), font=font_large
@@ -423,12 +495,11 @@ def generate_sheet(req: SheetRenderRequest):
   buf = io.BytesIO()
   img_out.save(buf, format="PNG")
   buf.seek(0)
-  print("  └ ✅ [シート生成完了] 返却します\n")
   return Response(content=buf.getvalue(), media_type="image/png")
 
 
 # ==========================================
-# 3. 画面UI
+# 3. 画面UI[cite: 1]
 # ==========================================
 
 
@@ -448,8 +519,13 @@ def get_scanner_page():
             .box-tag { background: #333; color: #00ffcc; padding: 2px 8px; border-radius: 4px; font-size: 12px; display: inline-block; margin-bottom: 8px; }
             p { color: #aaa; font-size: 12px; margin-bottom: 12px; }
             #reader-container { max-width: 380px; margin: 0 auto 15px auto; background: #000; border-radius: 10px; overflow: hidden; border: 2px solid #00ffcc; display: none; }
-            .btn-toggle { background: #00ffcc; color: #000; font-weight: bold; border: none; padding: 14px 20px; border-radius: 8px; cursor: pointer; font-size: 16px; width: 100%; max-width: 380px; margin-bottom: 15px; }
+            .btn-toggle { background: #00ffcc; color: #000; font-weight: bold; border: none; padding: 14px 20px; border-radius: 8px; cursor: pointer; font-size: 16px; width: 100%; max-width: 380px; margin-bottom: 10px; }
             
+            .manual-input-box { max-width: 380px; margin: 0 auto 15px auto; background: #1e1e1e; padding: 10px; border-radius: 8px; border: 1px solid #444; display: flex; gap: 6px; box-sizing: border-box; }
+            .manual-input { flex-grow: 1; background: #2a2a2a; color: #fff; border: 1px solid #555; padding: 8px 10px; border-radius: 6px; font-size: 14px; }
+            .btn-manual { background: #3498db; color: #fff; border: none; padding: 8px 14px; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 13px; white-space: nowrap; }
+            .btn-manual:hover { background: #2980b9; }
+
             .result-banner { background: #1e3a20; color: #d4edda; border: 1px solid #28a745; max-width: 380px; margin: 10px auto; padding: 10px; border-radius: 8px; text-align: left; display: none; font-size: 13px; }
             .banner-content { display: flex; align-items: center; justify-content: space-between; }
             .banner-item { display: flex; align-items: center; overflow: hidden; }
@@ -475,6 +551,7 @@ def get_scanner_page():
             .btn { background: #007bff; color: white; border: none; padding: 10px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; width: 100%; margin-top: 8px; font-weight: bold; }
             .btn-export { background: #28a745; }
             .btn-image { background: #ff9900; color: #000; }
+            .btn-lashin { background: #e67e22; color: #fff; }
             .btn-clear { background: transparent; border: 1px solid #666; color: #aaa; font-size: 11px; padding: 3px 8px; border-radius: 4px; cursor: pointer; }
             .btn-clear:hover { background: #442222; color: #ff6666; border-color: #ff6666; }
             
@@ -486,9 +563,15 @@ def get_scanner_page():
     <body>
         <h2>📦 買取インベントリ</h2>
         <div id="box-tag-display" class="box-tag">作業枠: メイン</div>
-        <p>カメラにかざすだけで自動連続読み取り</p>
+        <p>カメラにかざすか、バーコードを手打ち入力</p>
+        
         <button id="scan-toggle-btn" class="btn-toggle" onclick="toggleScanner()">📷 カメラを起動する</button>
         <div id="reader-container"><div id="interactive" style="width: 100%;"></div></div>
+
+        <div class="manual-input-box">
+            <input type="text" id="manual-jan-input" class="manual-input" placeholder="JANコードを手打ち入力..." onkeydown="if(event.key==='Enter') submitManualCode()">
+            <button class="btn-manual" onclick="submitManualCode()">追加</button>
+        </div>
 
         <div id="result-banner" class="result-banner">
             <div class="banner-content">
@@ -512,10 +595,12 @@ def get_scanner_page():
         <div class="list-section">
             <div class="summary-box">
                 <div>登録点数: <strong id="total-items" style="color:#00ffcc; font-size:18px;">0</strong> 点</div>
-                <button class="btn-clear" onclick="clearCart()">🗑️ リストを空にする</button>
+                <button class="btn-clear" onclick="clearCart()">🗑 リストを空にする</button>
             </div>
             <h3><span>📋 持込買取リスト</span></h3>
             <div id="cart-items"><p style="color: #777; text-align: center; margin: 8px 0;">まだ商品は追加されていません</p></div>
+            
+            <button class="btn btn-lashin" onclick="sendToLashinbangBox()">🚀 らしんばん買取BOXへ一括追加</button>
             <button class="btn btn-export" onclick="exportList()">📋 テキストリストをコピーする</button>
             <button class="btn btn-image" onclick="generatePreviewsServer()">🖼️ パッケージ写真プレビュー生成</button>
         </div>
@@ -590,6 +675,15 @@ def get_scanner_page():
                 }
             }
 
+            async function submitManualCode() {
+                const inputElem = document.getElementById("manual-jan-input");
+                const codeVal = inputElem.value.trim();
+                if (!codeVal) return;
+
+                inputElem.value = "";
+                await processAndAddCode(codeVal);
+            }
+
             async function onScanSuccess(decodedText) {
                 const now = Date.now();
                 if (decodedText === lastScannedCode && (now - lastScanTime) < 3000) return;
@@ -598,16 +692,20 @@ def get_scanner_page():
                 lastScannedCode = decodedText;
                 lastScanTime = now;
 
+                await processAndAddCode(decodedText);
+            }
+
+            async function processAndAddCode(codeText) {
                 try {
                     document.getElementById("error-msg").innerText = "照合中...";
                     const res = await fetch('/process_jan', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ jan: decodedText })
+                        body: JSON.stringify({ jan: codeText })
                     });
                     
                     if (!res.ok) {
-                        document.getElementById("error-msg").innerText = "未対応コード: " + decodedText;
+                        document.getElementById("error-msg").innerText = "未対応コード: " + codeText;
                         return;
                     }
 
@@ -640,6 +738,46 @@ def get_scanner_page():
                     if (navigator.vibrate) navigator.vibrate(50);
                 } catch (e) {
                     document.getElementById("error-msg").innerText = "通信エラー";
+                }
+            }
+
+            async function sendToLashinbangBox() {
+                const keys = Object.keys(cart);
+                if (keys.length === 0) {
+                    alert("リストが空です。先にスキャンまたは入力を行ってください。");
+                    return;
+                }
+
+                let jansToProcess = [];
+                keys.forEach(code => {
+                    const count = cart[code].count || 1;
+                    for (let i = 0; i < count; i++) {
+                        jansToProcess.push(code);
+                    }
+                });
+
+                if (!confirm(`持込リストの合計 ${jansToProcess.length} 件（アイテム種類数: ${keys.length}件）をらしんばんの買取BOXに一括追加します。よろしいですか？`)) {
+                    return;
+                }
+
+                alert("サーバーの裏でらしんばんへの自動追加処理を実行中です。完了するまで少しお待ちください。");
+
+                try {
+                    const response = await fetch('/api/bulk_add_box', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ jans: jansToProcess })
+                    });
+
+                    const data = await response.json();
+                    if (response.ok) {
+                        alert("✨ すべての商品のらしんばんBOXへの追加が完了しました！");
+                        window.open("https://shop.lashinbang.com/kaitori/offer?nattoku=1", "_blank");
+                    } else {
+                        alert("エラーが発生しました: " + (data.detail || '不明'));
+                    }
+                } catch (err) {
+                    alert("通信エラー: " + err.message);
                 }
             }
 
@@ -709,7 +847,7 @@ def get_scanner_page():
             function exportList() {
                 const keys = Object.keys(cart);
                 if (keys.length === 0) return alert("リストが空です。");
-                let text = `【 買取持込リスト (${currentBox}) 】\\n`, totalItems = 0;
+                let text = `【 買取持込リスト 】\\n`, totalItems = 0;
                 keys.forEach(code => {
                     const item = cart[code];
                     totalItems += item.count;
