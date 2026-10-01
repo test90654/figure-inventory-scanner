@@ -265,6 +265,10 @@ def get_image_bytes(jan: str, target_url: str):
       image.save(buf, format="JPEG", quality=90)
       jpeg_bytes = buf.getvalue()
 
+      # キャッシュを更新する前に既存の古いキャッシュがあれば削除
+      if os.path.exists(local_file):
+        os.remove(local_file)
+
       with open(local_file, "wb") as f:
         f.write(jpeg_bytes)
       return jpeg_bytes
@@ -327,7 +331,16 @@ sync_sheet_to_local()
 
 
 @app.get("/proxy_image")
-def proxy_image(url: str = None, jan: str = None):
+def proxy_image(url: str = None, jan: str = None, refresh: int = 0):
+  # refreshが指定された場合はローカルキャッシュを削除して再取得させる
+  if refresh == 1 and jan:
+    local_file = os.path.join(img_cache_dir, f"{jan}.jpg")
+    if os.path.exists(local_file):
+      try:
+        os.remove(local_file)
+      except Exception:
+        pass
+
   target_url = urllib.parse.unquote(url) if url else ""
   data = get_image_bytes(jan or "temp", target_url)
   if data:
@@ -438,10 +451,18 @@ def bulk_add_box(data: BulkAddRequest):
 def manual_register(data: ManualRegisterRequest):
   try:
     cleanText = "".join(filter(str.isdigit, data.jan))
-    meta = resolve_quote_meta(data.title)
-
+    
+    # 既存のデータ（商品名が空で画像URLだけ変えたい場合など）を考慮し、DBから既存タイトルを引く
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
+    cursor.execute("SELECT title, price FROM items WHERE jan = ?", (cleanText,))
+    existing = cursor.fetchone()
+    
+    final_title = data.title if (data.title and data.title.strip()) else (existing[0] if existing and existing[0] else f"プライズフィギュア ({cleanText})")
+    final_price = existing[1] if (existing and existing[1]) else data.price
+
+    meta = resolve_quote_meta(final_title)
+
     cursor.execute(
         """
             INSERT OR REPLACE INTO items (jan, title, image_url, price, maker, quote_label, source_url)
@@ -449,9 +470,9 @@ def manual_register(data: ManualRegisterRequest):
         """,
         (
             cleanText,
-            data.title,
+            final_title,
             data.image_url,
-            data.price,
+            final_price,
             meta["maker"],
             meta["quote_label"],
             meta["source_url"],
@@ -460,19 +481,31 @@ def manual_register(data: ManualRegisterRequest):
     conn.commit()
     conn.close()
 
+    # スプレッドシート側の該当行も更新または追加
     try:
       main_sheet, _ = get_gspread_sheets()
-      main_sheet.append_row(
-          [cleanText, data.title, data.image_url, data.price]
-      )
+      rows = main_sheet.get_all_values()
+      found_row = -1
+      for idx, row in enumerate(rows[1:], start=2):
+        if len(row) > 0 and row[0].strip() == cleanText:
+          found_row = idx
+          break
+      
+      if found_row != -1:
+        # 既存行がある場合はタイトル、画像URLを更新
+        main_sheet.update_cell(found_row, 2, final_title)
+        if data.image_url:
+          main_sheet.update_cell(found_row, 3, data.image_url)
+      else:
+        main_sheet.append_row([cleanText, final_title, data.image_url, final_price])
     except Exception as e:
-      print(f"⚠️ スプレッドシートへの手動登録追加スキップ: {e}")
+      print(f"⚠️ スプレッドシートの手動登録/画像更新スキップ: {e}")
 
     return {
         "status": "success",
         "jan": cleanText,
-        "title": data.title,
-        "price": data.price,
+        "title": final_title,
+        "price": final_price,
         "image_url": data.image_url,
         "quote_label": meta["quote_label"],
         "source_url": meta["source_url"],
@@ -625,11 +658,13 @@ def get_scanner_page():
             .item-quote { font-size: 10px; color: #38bdf8; margin-top: 2px; }
             .item-quote a { color: #38bdf8; text-decoration: none; }
             
-            .qty-control { display: flex; align-items: center; white-space: nowrap; flex-shrink: 0; }
+            .qty-control { display: flex; align-items: center; white-space: nowrap; flex-shrink: 0; gap: 4px; }
             .qty-btn { background: #444; color: white; border: none; width: 26px; height: 26px; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 14px; display: flex; align-items: center; justify-content: center; }
             .qty-btn:active { background: #666; }
-            .qty-val { margin: 0 6px; font-weight: bold; font-size: 13px; min-width: 16px; text-align: center; }
-            .del-btn { background: #cc3333; color: white; border: none; border-radius: 4px; padding: 4px 8px; margin-left: 6px; cursor: pointer; font-size: 11px; }
+            .qty-val { margin: 0 4px; font-weight: bold; font-size: 13px; min-width: 14px; text-align: center; }
+            .img-edit-btn { background: #e67e22; color: white; border: none; border-radius: 4px; padding: 4px 6px; cursor: pointer; font-size: 10px; }
+            .img-edit-btn:hover { background: #d35400; }
+            .del-btn { background: #cc3333; color: white; border: none; border-radius: 4px; padding: 4px 6px; cursor: pointer; font-size: 10px; }
             
             .summary-box { background: #222; border: 1px solid #444; padding: 10px; border-radius: 6px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; font-size: 14px; }
             .btn { background: #007bff; color: white; border: none; padding: 10px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; width: 100%; margin-top: 8px; font-weight: bold; }
@@ -641,7 +676,7 @@ def get_scanner_page():
             .btn-clear { background: transparent; border: 1px solid #666; color: #aaa; font-size: 11px; padding: 3px 8px; border-radius: 4px; cursor: pointer; }
             .btn-clear:hover { background: #442222; color: #ff6666; border-color: #ff6666; }
             
-            /* 不明商品手動登録モーダル */
+            /* 不明商品手動登録・画像再登録モーダル */
             #modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); display: none; justify-content: center; align-items: center; z-index: 1000; }
             .modal-content { background: #222; padding: 20px; border-radius: 8px; width: 90%; max-width: 320px; text-align: left; border: 1px solid #555; max-height: 90vh; overflow-y: auto; }
             .modal-content h3 { margin-top: 0; color: #ffcc00; font-size: 16px; }
@@ -700,11 +735,11 @@ def get_scanner_page():
         </div>
         <div id="preview-container"></div>
 
-        <!-- 不明商品手動登録モーダル -->
+        <!-- 手動登録・画像再登録モーダル -->
         <div id="modal-overlay">
             <div class="modal-content">
-                <h3>⚠️ 未登録商品（手動登録）</h3>
-                <p style="font-size: 11px; color: #ccc; margin-bottom: 8px;">DBに無いコードのため「未登録リスト」に記録しました。</p>
+                <h3 id="modal-heading">⚠️ 未登録商品（手動登録）</h3>
+                <p id="modal-desc" style="font-size: 11px; color: #ccc; margin-bottom: 8px;">DBに無いコードのため「未登録リスト」に記録しました。</p>
                 <button class="btn btn-google" style="margin-top:0; margin-bottom:8px;" onclick="openGoogleSearch()">🔍 GoogleでこのJANを調べる</button>
 
                 <label>JANコード</label>
@@ -857,6 +892,10 @@ def get_scanner_page():
                 
                 if (cart[code]) {
                     cart[code].count += 1;
+                    if (data.title) cart[code].title = data.title;
+                    if (data.image_url) cart[code].imageUrl = data.image_url;
+                    if (data.quote_label) cart[code].quote_label = data.quote_label;
+                    if (data.source_url) cart[code].source_url = data.source_url;
                 } else {
                     cart[code] = { 
                         jan: code, 
@@ -869,19 +908,34 @@ def get_scanner_page():
                 }
                 updateCartUI();
 
-                document.getElementById("res-title").innerText = data.title;
+                document.getElementById("res-title").innerText = cart[code].title;
                 document.getElementById("res-jan").innerText = "コード: " + code;
-                document.getElementById("res-quote").innerHTML = `出所: <a href="${data.source_url}" target="_blank" rel="noopener" style="color:#38bdf8;text-decoration:none;">${data.quote_label}</a>`;
+                document.getElementById("res-quote").innerHTML = `出所: <a href="${cart[code].source_url}" target="_blank" rel="noopener" style="color:#38bdf8;text-decoration:none;">${cart[code].quote_label}</a>`;
                 document.getElementById("res-count").innerText = cart[code].count;
-                document.getElementById("res-img").src = `/proxy_image?jan=${encodeURIComponent(code)}&url=${encodeURIComponent(data.image_url || '')}`;
+                // キャッシュを無視して新しい画像を描画するためにタイムスタンプを付与
+                document.getElementById("res-img").src = `/proxy_image?jan=${encodeURIComponent(code)}&url=${encodeURIComponent(cart[code].imageUrl || '')}&refresh=1&t=` + Date.now();
                 document.getElementById("result-banner").style.display = "block";
             }
 
-            window.openManualModal = function(jan) {
+            window.openManualModal = function(jan, existingTitle = "", existingImage = "") {
                 document.getElementById("modal-jan").value = jan;
-                document.getElementById("modal-title").value = "";
-                document.getElementById("modal-image").value = "";
+                document.getElementById("modal-title").value = existingTitle;
+                document.getElementById("modal-image").value = existingImage;
+                
+                if (existingTitle) {
+                    document.getElementById("modal-heading").innerText = "🖼️ 商品画像の再登録 (修正)";
+                    document.getElementById("modal-desc").innerText = "この商品の画像URLを変更・再登録します。";
+                } else {
+                    document.getElementById("modal-heading").innerText = "⚠️️ 未登録商品（手動登録）";
+                    document.getElementById("modal-desc").innerText = "DBに無いコードのため「未登録リスト」に記録しました。";
+                }
                 document.getElementById("modal-overlay").style.display = "flex";
+            }
+
+            window.openEditImageModal = function(code) {
+                const item = cart[code];
+                if (!item) return;
+                openManualModal(code, item.title, item.imageUrl || "");
             }
 
             window.closeModal = function() {
@@ -916,7 +970,7 @@ def get_scanner_page():
                     const data = await res.json();
                     closeModal();
                     addOrUpdateCartItem(data);
-                    document.getElementById("error-msg").innerText = "手動登録してリストに追加しました！";
+                    document.getElementById("error-msg").innerText = "画像・情報を更新してリストに反映しました！";
                 } catch (err) {
                     alert("エラー: " + err.message);
                 }
@@ -1023,6 +1077,7 @@ def get_scanner_page():
                             <button class="qty-btn" onclick="changeQty('${code}', -1)">-</button>
                             <span class="qty-val">${item.count}</span>
                             <button class="qty-btn" onclick="changeQty('${code}', 1)">+</button>
+                            <button class="img-edit-btn" onclick="openEditImageModal('${code}')">画像</button>
                             <button class="del-btn" onclick="removeItem('${code}')">×</button>
                         </div>
                     `;
