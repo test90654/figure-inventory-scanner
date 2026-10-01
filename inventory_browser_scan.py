@@ -38,7 +38,7 @@ if not os.path.exists(credential_path):
       f.write(gcp_json_env)
 
 # ==========================================
-# 1. 引用元の自動判定ロジック
+# 1. 引用元の自動判定ロジック[cite: 1]
 # ==========================================
 
 
@@ -127,7 +127,7 @@ def resolve_quote_meta(title: str):
 
 
 # ==========================================
-# 2. DB初期化
+# 2. DB初期化[cite: 1]
 # ==========================================
 
 
@@ -226,7 +226,6 @@ def get_image_bytes(jan: str, target_url: str):
     with open(local_file, "rb") as f:
       return f.read()
 
-  # 自力アップロード等ですでにローカル保存されている場合のケア
   if target_url and target_url.startswith("local_upload:"):
     if os.path.exists(local_file):
       with open(local_file, "rb") as f:
@@ -279,7 +278,7 @@ def get_image_bytes(jan: str, target_url: str):
         f.write(jpeg_bytes)
       return jpeg_bytes
     except Exception as img_err:
-      print(f"⚠️ 画像変換エラー (JAN: {jan}): {img_err}")
+      print(f"⚠️️ 画像変換エラー (JAN: {jan}): {img_err}")
       with open(local_file, "wb") as f:
         f.write(res.content)
       return res.content
@@ -476,7 +475,6 @@ async def manual_register(
 
     final_image_url = image_url
 
-    # 自力ファイルアップロードがある場合の処理
     if file and file.filename:
       contents = await file.read()
       if contents:
@@ -643,7 +641,7 @@ def generate_sheet(req: SheetRenderRequest):
 
 
 # ==========================================
-# 3. 画面UI
+# 3. 画面UI[cite: 1]
 # ==========================================
 
 
@@ -951,7 +949,7 @@ def get_scanner_page():
                 document.getElementById("modal-jan").value = jan;
                 document.getElementById("modal-title").value = existingTitle;
                 document.getElementById("modal-image").value = existingImage;
-                document.getElementById("modal-file").value = ""; // ファイル選択をクリア
+                document.getElementById("modal-file").value = "";
                 
                 if (existingTitle) {
                     document.getElementById("modal-heading").innerText = "🖼️ 商品画像の再登録 / 修正";
@@ -1009,7 +1007,26 @@ def get_scanner_page():
 
                     const data = await res.json();
                     closeModal();
-                    addOrUpdateCartItem(data);
+
+                    // すでにカートにある場合は個数を増やさず情報だけ上書き更新する
+                    if (cart[jan]) {
+                        cart[jan].title = data.title;
+                        cart[jan].imageUrl = data.image_url;
+                        cart[jan].quote_label = data.quote_label;
+                        cart[jan].source_url = data.source_url;
+                        updateCartUI();
+                        
+                        currentBannerJan = jan;
+                        document.getElementById("res-title").innerText = data.title;
+                        document.getElementById("res-jan").innerText = "コード: " + jan;
+                        document.getElementById("res-quote").innerHTML = `出所: <a href="${data.source_url}" target="_blank" rel="noopener" style="color:#38bdf8;text-decoration:none;">${data.quote_label}</a>`;
+                        document.getElementById("res-count").innerText = cart[jan].count;
+                        document.getElementById("res-img").src = `/proxy_image?jan=${encodeURIComponent(jan)}&url=${encodeURIComponent(data.image_url || '')}&refresh=1&t=` + Date.now();
+                        document.getElementById("result-banner").style.display = "block";
+                    } else {
+                        addOrUpdateCartItem(data);
+                    }
+
                     document.getElementById("error-msg").innerText = "画像・情報を更新してリストに反映しました！";
                 } catch (err) {
                     alert("エラー: " + err.message);
