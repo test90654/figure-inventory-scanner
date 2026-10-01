@@ -6,7 +6,7 @@ import sqlite3
 import traceback
 import urllib.parse
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 import gspread
@@ -38,7 +38,7 @@ if not os.path.exists(credential_path):
       f.write(gcp_json_env)
 
 # ==========================================
-# 1. 引用元の自動判定ロジック[cite: 1]
+# 1. 引用元の自動判定ロジック
 # ==========================================
 
 
@@ -127,7 +127,7 @@ def resolve_quote_meta(title: str):
 
 
 # ==========================================
-# 2. DB初期化[cite: 1]
+# 2. DB初期化
 # ==========================================
 
 
@@ -226,6 +226,13 @@ def get_image_bytes(jan: str, target_url: str):
     with open(local_file, "rb") as f:
       return f.read()
 
+  # 自力アップロード等ですでにローカル保存されている場合のケア
+  if target_url and target_url.startswith("local_upload:"):
+    if os.path.exists(local_file):
+      with open(local_file, "rb") as f:
+        return f.read()
+    return None
+
   headers = {
       "User-Agent": (
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -236,7 +243,7 @@ def get_image_bytes(jan: str, target_url: str):
     target_url = "https://www.pasomaru.co.jp" + target_url
 
   res = None
-  if target_url:
+  if target_url and not target_url.startswith("local_upload:"):
     try:
       res = requests.get(target_url, headers=headers, timeout=3.0)
     except Exception:
@@ -265,7 +272,6 @@ def get_image_bytes(jan: str, target_url: str):
       image.save(buf, format="JPEG", quality=90)
       jpeg_bytes = buf.getvalue()
 
-      # キャッシュを更新する前に既存の古いキャッシュがあれば削除
       if os.path.exists(local_file):
         os.remove(local_file)
 
@@ -332,10 +338,11 @@ sync_sheet_to_local()
 
 @app.get("/proxy_image")
 def proxy_image(url: str = None, jan: str = None, refresh: int = 0):
-  # refreshが指定された場合はローカルキャッシュを削除して再取得させる
   if refresh == 1 and jan:
     local_file = os.path.join(img_cache_dir, f"{jan}.jpg")
-    if os.path.exists(local_file):
+    if os.path.exists(local_file) and not (
+        url and url.startswith("local_upload:")
+    ):
       try:
         os.remove(local_file)
       except Exception:
@@ -369,13 +376,6 @@ class SheetRenderRequest(BaseModel):
 
 class BulkAddRequest(BaseModel):
   jans: list[str]
-
-
-class ManualRegisterRequest(BaseModel):
-  jan: str
-  title: str
-  price: str = "買取中!!"
-  image_url: str = ""
 
 
 @app.post("/api/bulk_add_box")
@@ -448,18 +448,45 @@ def bulk_add_box(data: BulkAddRequest):
 
 
 @app.post("/manual_register")
-def manual_register(data: ManualRegisterRequest):
+async def manual_register(
+    jan: str = Form(...),
+    title: str = Form(...),
+    price: str = Form("買取中!!"),
+    image_url: str = Form(""),
+    file: UploadFile = File(None),
+):
   try:
-    cleanText = "".join(filter(str.isdigit, data.jan))
-    
-    # 既存のデータ（商品名が空で画像URLだけ変えたい場合など）を考慮し、DBから既存タイトルを引く
+    cleanText = "".join(filter(str.isdigit, jan))
+
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute("SELECT title, price FROM items WHERE jan = ?", (cleanText,))
     existing = cursor.fetchone()
-    
-    final_title = data.title if (data.title and data.title.strip()) else (existing[0] if existing and existing[0] else f"プライズフィギュア ({cleanText})")
-    final_price = existing[1] if (existing and existing[1]) else data.price
+
+    final_title = (
+        title
+        if (title and title.strip())
+        else (
+            existing[0]
+            if existing and existing[0]
+            else f"プライズフィギュア ({cleanText})"
+        )
+    )
+    final_price = existing[1] if (existing and existing[1]) else price
+
+    final_image_url = image_url
+
+    # 自力ファイルアップロードがある場合の処理
+    if file and file.filename:
+      contents = await file.read()
+      if contents:
+        local_file = os.path.join(img_cache_dir, f"{cleanText}.jpg")
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=90)
+        with open(local_file, "wb") as f:
+          f.write(buf.getvalue())
+        final_image_url = "local_upload:" + file.filename
 
     meta = resolve_quote_meta(final_title)
 
@@ -471,7 +498,7 @@ def manual_register(data: ManualRegisterRequest):
         (
             cleanText,
             final_title,
-            data.image_url,
+            final_image_url,
             final_price,
             meta["maker"],
             meta["quote_label"],
@@ -481,7 +508,6 @@ def manual_register(data: ManualRegisterRequest):
     conn.commit()
     conn.close()
 
-    # スプレッドシート側の該当行も更新または追加
     try:
       main_sheet, _ = get_gspread_sheets()
       rows = main_sheet.get_all_values()
@@ -490,14 +516,15 @@ def manual_register(data: ManualRegisterRequest):
         if len(row) > 0 and row[0].strip() == cleanText:
           found_row = idx
           break
-      
+
       if found_row != -1:
-        # 既存行がある場合はタイトル、画像URLを更新
         main_sheet.update_cell(found_row, 2, final_title)
-        if data.image_url:
-          main_sheet.update_cell(found_row, 3, data.image_url)
+        if final_image_url:
+          main_sheet.update_cell(found_row, 3, final_image_url)
       else:
-        main_sheet.append_row([cleanText, final_title, data.image_url, final_price])
+        main_sheet.append_row(
+            [cleanText, final_title, final_image_url, final_price]
+        )
     except Exception as e:
       print(f"⚠️ スプレッドシートの手動登録/画像更新スキップ: {e}")
 
@@ -506,7 +533,7 @@ def manual_register(data: ManualRegisterRequest):
         "jan": cleanText,
         "title": final_title,
         "price": final_price,
-        "image_url": data.image_url,
+        "image_url": final_image_url,
         "quote_label": meta["quote_label"],
         "source_url": meta["source_url"],
     }
@@ -616,7 +643,7 @@ def generate_sheet(req: SheetRenderRequest):
 
 
 # ==========================================
-# 3. 画面UI[cite: 1]
+# 3. 画面UI
 # ==========================================
 
 
@@ -652,6 +679,7 @@ def get_scanner_page():
             .list-section { background: #1e1e1e; color: #fff; max-width: 380px; margin: 15px auto; padding: 12px; border-radius: 8px; text-align: left; }
             .list-section h3 { font-size: 14px; margin-top: 0; border-bottom: 2px solid #333; padding-bottom: 5px; }
             .item-row { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #2c2c2c; padding: 10px 0; font-size: 12px; gap: 8px; }
+            .item-thumb { width: 36px; height: 36px; object-fit: cover; background: #fff; border-radius: 4px; flex-shrink: 0; border: 1px solid #444; }
             .item-info { flex-grow: 1; overflow: hidden; }
             .item-title { color: #eee; line-height: 1.4; font-weight: bold; }
             .item-jan { color: #888; font-size: 11px; margin-top: 2px; }
@@ -659,12 +687,12 @@ def get_scanner_page():
             .item-quote a { color: #38bdf8; text-decoration: none; }
             
             .qty-control { display: flex; align-items: center; white-space: nowrap; flex-shrink: 0; gap: 4px; }
-            .qty-btn { background: #444; color: white; border: none; width: 26px; height: 26px; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 14px; display: flex; align-items: center; justify-content: center; }
+            .qty-btn { background: #444; color: white; border: none; width: 24px; height: 24px; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 13px; display: flex; align-items: center; justify-content: center; }
             .qty-btn:active { background: #666; }
-            .qty-val { margin: 0 4px; font-weight: bold; font-size: 13px; min-width: 14px; text-align: center; }
-            .img-edit-btn { background: #e67e22; color: white; border: none; border-radius: 4px; padding: 4px 6px; cursor: pointer; font-size: 10px; }
+            .qty-val { margin: 0 2px; font-weight: bold; font-size: 12px; min-width: 14px; text-align: center; }
+            .img-edit-btn { background: #e67e22; color: white; border: none; border-radius: 4px; padding: 4px 5px; cursor: pointer; font-size: 10px; }
             .img-edit-btn:hover { background: #d35400; }
-            .del-btn { background: #cc3333; color: white; border: none; border-radius: 4px; padding: 4px 6px; cursor: pointer; font-size: 10px; }
+            .del-btn { background: #cc3333; color: white; border: none; border-radius: 4px; padding: 4px 5px; cursor: pointer; font-size: 10px; }
             
             .summary-box { background: #222; border: 1px solid #444; padding: 10px; border-radius: 6px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; font-size: 14px; }
             .btn { background: #007bff; color: white; border: none; padding: 10px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; width: 100%; margin-top: 8px; font-weight: bold; }
@@ -676,12 +704,11 @@ def get_scanner_page():
             .btn-clear { background: transparent; border: 1px solid #666; color: #aaa; font-size: 11px; padding: 3px 8px; border-radius: 4px; cursor: pointer; }
             .btn-clear:hover { background: #442222; color: #ff6666; border-color: #ff6666; }
             
-            /* 不明商品手動登録・画像再登録モーダル */
             #modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); display: none; justify-content: center; align-items: center; z-index: 1000; }
             .modal-content { background: #222; padding: 20px; border-radius: 8px; width: 90%; max-width: 320px; text-align: left; border: 1px solid #555; max-height: 90vh; overflow-y: auto; }
             .modal-content h3 { margin-top: 0; color: #ffcc00; font-size: 16px; }
             .modal-content label { font-size: 12px; color: #aaa; display: block; margin-top: 8px; }
-            .modal-content input { width: 100%; padding: 8px; margin-top: 4px; background: #333; border: 1px solid #555; color: #fff; border-radius: 4px; box-sizing: border-box; }
+            .modal-content input[type="text"], .modal-content input[type="file"] { width: 100%; padding: 8px; margin-top: 4px; background: #333; border: 1px solid #555; color: #fff; border-radius: 4px; box-sizing: border-box; font-size: 13px; }
             .modal-btns { display: flex; gap: 8px; margin-top: 15px; }
 
             #preview-container { display: flex; flex-direction: column; align-items: center; gap: 20px; margin-top: 15px; }
@@ -735,7 +762,7 @@ def get_scanner_page():
         </div>
         <div id="preview-container"></div>
 
-        <!-- 手動登録・画像再登録モーダル -->
+        <!-- 手動登録・画像再登録・ファイルアップロードモーダル -->
         <div id="modal-overlay">
             <div class="modal-content">
                 <h3 id="modal-heading">⚠️ 未登録商品（手動登録）</h3>
@@ -746,8 +773,12 @@ def get_scanner_page():
                 <input type="text" id="modal-jan" readonly style="background: #222; color: #888;">
                 <label>商品名</label>
                 <input type="text" id="modal-title" placeholder="例: フィギュア名など">
-                <label>画像URL (任意・WebP可)</label>
-                <input type="text" id="modal-image" placeholder="例: 公式サイト等の画像URLを貼り付け">
+                
+                <label>画像URL (任意)</label>
+                <input type="text" id="modal-image" placeholder="例: 公式サイト等の画像URL">
+
+                <label>または画像ファイルをアップロード</label>
+                <input type="file" id="modal-file" accept="image/*">
 
                 <div class="modal-btns">
                     <button class="btn" style="background:#555; margin-top:0;" onclick="closeModal()">キャンセル</button>
@@ -912,7 +943,6 @@ def get_scanner_page():
                 document.getElementById("res-jan").innerText = "コード: " + code;
                 document.getElementById("res-quote").innerHTML = `出所: <a href="${cart[code].source_url}" target="_blank" rel="noopener" style="color:#38bdf8;text-decoration:none;">${cart[code].quote_label}</a>`;
                 document.getElementById("res-count").innerText = cart[code].count;
-                // キャッシュを無視して新しい画像を描画するためにタイムスタンプを付与
                 document.getElementById("res-img").src = `/proxy_image?jan=${encodeURIComponent(code)}&url=${encodeURIComponent(cart[code].imageUrl || '')}&refresh=1&t=` + Date.now();
                 document.getElementById("result-banner").style.display = "block";
             }
@@ -921,12 +951,13 @@ def get_scanner_page():
                 document.getElementById("modal-jan").value = jan;
                 document.getElementById("modal-title").value = existingTitle;
                 document.getElementById("modal-image").value = existingImage;
+                document.getElementById("modal-file").value = ""; // ファイル選択をクリア
                 
                 if (existingTitle) {
-                    document.getElementById("modal-heading").innerText = "🖼️ 商品画像の再登録 (修正)";
-                    document.getElementById("modal-desc").innerText = "この商品の画像URLを変更・再登録します。";
+                    document.getElementById("modal-heading").innerText = "🖼️ 商品画像の再登録 / 修正";
+                    document.getElementById("modal-desc").innerText = "画像URLの変更、またはファイルから直接画像をアップロードできます。";
                 } else {
-                    document.getElementById("modal-heading").innerText = "⚠️️ 未登録商品（手動登録）";
+                    document.getElementById("modal-heading").innerText = "⚠ 未登録商品（手動登録）";
                     document.getElementById("modal-desc").innerText = "DBに無いコードのため「未登録リスト」に記録しました。";
                 }
                 document.getElementById("modal-overlay").style.display = "flex";
@@ -952,17 +983,26 @@ def get_scanner_page():
                 const jan = document.getElementById("modal-jan").value;
                 const title = document.getElementById("modal-title").value.trim();
                 const imageUrl = document.getElementById("modal-image").value.trim();
+                const fileInput = document.getElementById("modal-file");
 
                 if (!title) {
                     alert("商品名を入力してください。");
                     return;
                 }
 
+                const formData = new FormData();
+                formData.append("jan", jan);
+                formData.append("title", title);
+                formData.append("price", "買取中!!");
+                formData.append("image_url", imageUrl);
+                if (fileInput.files.length > 0) {
+                    formData.append("file", fileInput.files[0]);
+                }
+
                 try {
                     const res = await fetch('/manual_register', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ jan: jan, title: title, price: "買取中!!", image_url: imageUrl })
+                        body: formData
                     });
 
                     if (!res.ok) throw new Error("登録に失敗しました");
@@ -1065,9 +1105,11 @@ def get_scanner_page():
                 keys.forEach(code => {
                     const item = cart[code];
                     totalItems += item.count;
+                    const thumbUrl = `/proxy_image?jan=${encodeURIComponent(code)}&url=${encodeURIComponent(item.imageUrl || '')}&t=` + Date.now();
                     const row = document.createElement("div");
                     row.className = "item-row";
                     row.innerHTML = `
+                        <img src="${thumbUrl}" class="item-thumb" onerror="this.style.background='#442222';">
                         <div class="item-info">
                             <div class="item-title">${item.title}</div>
                             <div class="item-jan">コード: ${item.jan}</div>
