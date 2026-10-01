@@ -1,0 +1,32 @@
+name: Nightly Pasomaru Import
+
+on:
+  schedule:
+    # 毎日 UTC 18:00（日本時間 翌朝 3:00）に実行
+    - cron: '0 18 * * *'
+  workflow_dispatch: # 手動でも実行できるようにする
+
+jobs:
+  run-import:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install --no-cache-dir beautifulsoup4 gspread oauth2client requests
+
+      - name: Create credentials.json from Secrets
+        env:
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+        run: |
+          echo "$GCP_CREDENTIALS_JSON" > credentials.json
+
+      - name: Run import script
+        run: python import_pasomaru_2.py
