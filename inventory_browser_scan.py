@@ -696,6 +696,8 @@ def get_scanner_page():
             .btn { background: #007bff; color: white; border: none; padding: 10px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; width: 100%; margin-top: 8px; font-weight: bold; }
             .btn-export { background: #28a745; }
             .btn-image { background: #ff9900; color: #000; }
+            .btn-batch-dl { background: #8e44ad; color: #fff; }
+            .btn-batch-dl:hover { background: #732d91; }
             .btn-lashin { background: #e67e22; color: #fff; }
             .btn-google { background: #4285F4; color: #fff; }
             .btn-google:hover { background: #3367D6; }
@@ -754,6 +756,7 @@ def get_scanner_page():
             <h3><span>📋 持込買取リスト</span></h3>
             <div id="cart-items"><p style="color: #777; text-align: center; margin: 8px 0;">まだ商品は追加されていません</p></div>
             
+            <button class="btn btn-batch-dl" onclick="downloadAllImages()">📂 画像を個別で一括ダウンロード</button>
             <button class="btn btn-lashin" onclick="sendToLashinbangBox()">🚀 らしんばん買取BOXへ一括追加</button>
             <button class="btn btn-export" onclick="exportList()">📋 テキストリストをコピーする</button>
             <button class="btn btn-image" onclick="generatePreviewsServer()">🖼️ パッケージ写真プレビュー生成</button>
@@ -913,6 +916,43 @@ def get_scanner_page():
                 } catch (e) {
                     document.getElementById("error-msg").innerText = "通信エラー";
                 }
+            }
+
+            window.downloadAllImages = async function() {
+                const keys = Object.keys(cart);
+                if (keys.length === 0) {
+                    alert("リストが空です。");
+                    return;
+                }
+                if (!confirm(`リストにある ${keys.length} 件の画像を個別のファイルとして一括ダウンロードします。よろしいですか？\n（※ブラウザの設定により複数ファイルのダウンロード許可が必要です）`)) {
+                    return;
+                }
+
+                for (let i = 0; i < keys.length; i++) {
+                    const code = keys[i];
+                    const item = cart[code];
+                    const proxyUrl = `/proxy_image?jan=${encodeURIComponent(code)}&url=${encodeURIComponent(item.imageUrl || '')}`;
+                    
+                    try {
+                        const response = await fetch(proxyUrl);
+                        if (response.ok) {
+                            const blob = await response.blob();
+                            const blobUrl = URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            a.href = blobUrl;
+                            a.download = `${code}.jpg`;
+                            document.body.appendChild(a);
+                            a.click();
+                            document.body.removeChild(a);
+                            URL.revokeObjectURL(blobUrl);
+                        }
+                    } catch (e) {
+                        console.error(`画像ダウンロード失敗: ${code}`, e);
+                    }
+                    // ブラウザのブロックを防ぐためのわずかなウェイト
+                    await new Promise(resolve => setTimeout(resolve, 300));
+                }
+                alert("すべての画像のダウンロード指示を送信しました！");
             }
 
             function addOrUpdateCartItem(data) {
@@ -1275,7 +1315,7 @@ def process_jan_code(data: ScanRequest):
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         unreg_sheet.append_row([cleanText, now_str])
       except Exception as sheet_err:
-        print(f"⚠️️ スプレッドシート未登録リスト保存スキップ: {sheet_err}")
+        print(f"⚠️ スプレッドシート未登録リスト保存スキップ: {sheet_err}")
 
       return JSONResponse(
           status_code=404,
