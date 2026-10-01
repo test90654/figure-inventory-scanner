@@ -1,3 +1,4 @@
+import datetime
 import io
 import json
 import os
@@ -7,7 +8,7 @@ import urllib.parse
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from PIL import Image, ImageDraw, ImageFont
@@ -144,6 +145,12 @@ def init_db():
             source_url TEXT DEFAULT ''
         )
     """)
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS unregistered_logs (
+            jan TEXT PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
   for col, col_def in [
       ("maker", "TEXT DEFAULT '公式・流通'"),
       ("quote_label", "TEXT DEFAULT '流通 / 商品カタログ'"),
@@ -159,6 +166,30 @@ def init_db():
 
 
 init_db()
+
+
+def get_gspread_sheets():
+  scope = [
+      "https://spreadsheets.google.com/feeds",
+      "https://www.googleapis.com/auth/drive",
+  ]
+  creds = ServiceAccountCredentials.from_json_keyfile_name(
+      credential_path, scope
+  )
+  client = gspread.authorize(creds)
+  SPREADSHEET_ID = "1CHnUUP_9uiZYaWzbpoaTIjYwyFY5YBAv4x5M3gka2T0"
+  spreadsheet = client.open_by_key(SPREADSHEET_ID)
+
+  main_sheet = spreadsheet.sheet1
+  try:
+    unreg_sheet = spreadsheet.worksheet("未登録リスト")
+  except gspread.exceptions.WorksheetNotFound:
+    unreg_sheet = spreadsheet.add_worksheet(
+        title="未登録リスト", rows="1000", cols="2"
+    )
+    unreg_sheet.append_row(["JAN", "発見日時"])
+
+  return main_sheet, unreg_sheet
 
 
 def search_neatz_fallback(query_code: str):
@@ -240,17 +271,8 @@ def sync_sheet_to_local():
     print("⚠️ credentials.json が見つかりません。")
     return
   try:
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(
-        credential_path, scope
-    )
-    client = gspread.authorize(creds)
-    SPREADSHEET_ID = "1CHnUUP_9uiZYaWzbpoaTIjYwyFY5YBAv4x5M3gka2T0"
-    sheet = client.open_by_key(SPREADSHEET_ID).sheet1
-    rows = sheet.get_all_values()
+    main_sheet, _ = get_gspread_sheets()
+    rows = main_sheet.get_all_values()
 
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -325,12 +347,18 @@ class BulkAddRequest(BaseModel):
   jans: list[str]
 
 
+class ManualRegisterRequest(BaseModel):
+  jan: str
+  title: str
+  price: str = "買取中!!"
+  image_url: str = ""
+
+
 @app.post("/api/bulk_add_box")
 def bulk_add_box(data: BulkAddRequest):
   results = []
   try:
     with sync_playwright() as p:
-      # 💡 headless=True に戻して裏でスマートに実行
       browser = p.chromium.launch(
           headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"]
       )
@@ -353,7 +381,6 @@ def bulk_add_box(data: BulkAddRequest):
         try:
           search_url = f"https://shop.lashinbang.com/kaitori/list?jan={jan}"
           page.goto(search_url, timeout=10000)
-
           page.wait_for_selector("li[data-product-id]", timeout=5000)
 
           product_id = page.eval_on_selector(
@@ -384,7 +411,6 @@ def bulk_add_box(data: BulkAddRequest):
             )
 
         except Exception as e:
-          print(f"Error processing JAN {jan}: {str(e)}")
           results.append({"jan": jan, "status": "error", "message": str(e)})
 
         page.wait_for_timeout(1000)
@@ -395,6 +421,53 @@ def bulk_add_box(data: BulkAddRequest):
     raise HTTPException(status_code=500, detail=str(e))
 
   return {"status": "completed", "results": results}
+
+
+@app.post("/manual_register")
+def manual_register(data: ManualRegisterRequest):
+  try:
+    cleanText = "".join(filter(str.isdigit, data.jan))
+    meta = resolve_quote_meta(data.title)
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+            INSERT OR REPLACE INTO items (jan, title, image_url, price, maker, quote_label, source_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            cleanText,
+            data.title,
+            data.image_url,
+            data.price,
+            meta["maker"],
+            meta["quote_label"],
+            meta["source_url"],
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    try:
+      main_sheet, _ = get_gspread_sheets()
+      main_sheet.append_row(
+          [cleanText, data.title, data.image_url, data.price]
+      )
+    except Exception as e:
+      print(f"⚠️ スプレッドシートへの手動登録追加スキップ: {e}")
+
+    return {
+        "status": "success",
+        "jan": cleanText,
+        "title": data.title,
+        "price": data.price,
+        "image_url": data.image_url,
+        "quote_label": meta["quote_label"],
+        "source_url": meta["source_url"],
+    }
+  except Exception as e:
+    raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/generate_sheet")
@@ -552,9 +625,19 @@ def get_scanner_page():
             .btn-export { background: #28a745; }
             .btn-image { background: #ff9900; color: #000; }
             .btn-lashin { background: #e67e22; color: #fff; }
+            .btn-google { background: #4285F4; color: #fff; }
+            .btn-google:hover { background: #3367D6; }
             .btn-clear { background: transparent; border: 1px solid #666; color: #aaa; font-size: 11px; padding: 3px 8px; border-radius: 4px; cursor: pointer; }
             .btn-clear:hover { background: #442222; color: #ff6666; border-color: #ff6666; }
             
+            /* 不明商品手動登録モーダル */
+            #modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); display: none; justify-content: center; align-items: center; z-index: 1000; }
+            .modal-content { background: #222; padding: 20px; border-radius: 8px; width: 90%; max-width: 320px; text-align: left; border: 1px solid #555; }
+            .modal-content h3 { margin-top: 0; color: #ffcc00; font-size: 16px; }
+            .modal-content label { font-size: 12px; color: #aaa; display: block; margin-top: 8px; }
+            .modal-content input { width: 100%; padding: 8px; margin-top: 4px; background: #333; border: 1px solid #555; color: #fff; border-radius: 4px; box-sizing: border-box; }
+            .modal-btns { display: flex; gap: 8px; margin-top: 15px; }
+
             #preview-container { display: flex; flex-direction: column; align-items: center; gap: 20px; margin-top: 15px; }
             .preview-card { background: #1e1e1e; padding: 12px; border-radius: 8px; border: 1px solid #444; width: 100%; max-width: 380px; box-sizing: border-box; text-align: left; }
             .preview-img { width: 100%; height: auto; border-radius: 4px; border: 1px solid #555; display: block; }
@@ -605,6 +688,26 @@ def get_scanner_page():
             <button class="btn btn-image" onclick="generatePreviewsServer()">🖼️ パッケージ写真プレビュー生成</button>
         </div>
         <div id="preview-container"></div>
+
+        <!-- 不明商品手動登録モーダル -->
+        <div id="modal-overlay">
+            <div class="modal-content">
+                <h3>⚠️ 未登録商品（手動登録）</h3>
+                <p style="font-size: 11px; color: #ccc; margin-bottom: 8px;">DBに無いコードのため「未登録リスト」に記録しました。</p>
+                
+                <!-- Googleで調べるボタンを追加 -->
+                <button class="btn btn-google" style="margin-top:0; margin-bottom:8px;" onclick="openGoogleSearch()">🔍 GoogleでこのJANを調べる</button>
+
+                <label>JANコード</label>
+                <input type="text" id="modal-jan" readonly style="background: #222; color: #888;">
+                <label>商品名</label>
+                <input type="text" id="modal-title" placeholder="例: フィギュア名など">
+                <div class="modal-btns">
+                    <button class="btn" style="background:#555; margin-top:0;" onclick="closeModal()">キャンセル</button>
+                    <button class="btn" style="background:#28a745; margin-top:0;" onclick="submitManualItem()">登録して追加</button>
+                </div>
+            </div>
+        </div>
 
         <script>
             const urlParams = new URLSearchParams(window.location.search);
@@ -705,34 +808,18 @@ def get_scanner_page():
                     });
                     
                     if (!res.ok) {
+                        const errData = await res.json().catch(() => ({}));
+                        if (res.status === 404) {
+                            openManualModal(errData.jan || codeText);
+                            document.getElementById("error-msg").innerText = "未登録商品を検出し、未登録リストに記録しました。";
+                            return;
+                        }
                         document.getElementById("error-msg").innerText = "未対応コード: " + codeText;
                         return;
                     }
 
                     const data = await res.json();
-                    const code = data.jan;
-                    currentBannerJan = code;
-                    
-                    if (cart[code]) {
-                        cart[code].count += 1;
-                    } else {
-                        cart[code] = { 
-                            jan: code, 
-                            title: data.title || "", 
-                            imageUrl: data.image_url || "", 
-                            count: 1,
-                            quote_label: data.quote_label || "流通 / 商品カタログ",
-                            source_url: data.source_url || "#"
-                        };
-                    }
-                    updateCartUI();
-
-                    document.getElementById("res-title").innerText = data.title;
-                    document.getElementById("res-jan").innerText = "コード: " + code;
-                    document.getElementById("res-quote").innerHTML = `出所: <a href="${data.source_url}" target="_blank" rel="noopener" style="color:#38bdf8;text-decoration:none;">${data.quote_label}</a>`;
-                    document.getElementById("res-count").innerText = cart[code].count;
-                    document.getElementById("res-img").src = `/proxy_image?jan=${encodeURIComponent(code)}&url=${encodeURIComponent(data.image_url || '')}`;
-                    document.getElementById("result-banner").style.display = "block";
+                    addOrUpdateCartItem(data);
                     document.getElementById("error-msg").innerText = "";
 
                     if (navigator.vibrate) navigator.vibrate(50);
@@ -741,7 +828,77 @@ def get_scanner_page():
                 }
             }
 
-            async function sendToLashinbangBox() {
+            function addOrUpdateCartItem(data) {
+                const code = data.jan;
+                currentBannerJan = code;
+                
+                if (cart[code]) {
+                    cart[code].count += 1;
+                } else {
+                    cart[code] = { 
+                        jan: code, 
+                        title: data.title || "", 
+                        imageUrl: data.image_url || "", 
+                        count: 1,
+                        quote_label: data.quote_label || "流通 / 商品カタログ",
+                        source_url: data.source_url || "#"
+                    };
+                }
+                updateCartUI();
+
+                document.getElementById("res-title").innerText = data.title;
+                document.getElementById("res-jan").innerText = "コード: " + code;
+                document.getElementById("res-quote").innerHTML = `出所: <a href="${data.source_url}" target="_blank" rel="noopener" style="color:#38bdf8;text-decoration:none;">${data.quote_label}</a>`;
+                document.getElementById("res-count").innerText = cart[code].count;
+                document.getElementById("res-img").src = `/proxy_image?jan=${encodeURIComponent(code)}&url=${encodeURIComponent(data.image_url || '')}`;
+                document.getElementById("result-banner").style.display = "block";
+            }
+
+            function openManualModal(jan) {
+                document.getElementById("modal-jan").value = jan;
+                document.getElementById("modal-title").value = "";
+                document.getElementById("modal-overlay").style.display = "flex";
+            }
+
+            function closeModal() {
+                document.getElementById("modal-overlay").style.display = "none";
+            }
+
+            // Google検索を別タブで開く関数
+            function openGoogleSearch() {
+                const jan = document.getElementById("modal-jan").value;
+                const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(jan)}`;
+                window.open(searchUrl, '_blank');
+            }
+
+            async function submitManualItem() {
+                const jan = document.getElementById("modal-jan").value;
+                const title = document.getElementById("modal-title").value.trim();
+
+                if (!title) {
+                    alert("商品名を入力してください。");
+                    return;
+                }
+
+                try {
+                    const res = await fetch('/manual_register', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ jan: jan, title: title, price: "買取中!!", image_url: "" })
+                    });
+
+                    if (!res.ok) throw new Error("登録に失敗しました");
+
+                    const data = await res.json();
+                    closeModal();
+                    addOrUpdateCartItem(data);
+                    document.getElementById("error-msg").innerText = "手動登録してリストに追加しました！";
+                } catch (err) {
+                    alert("エラー: " + err.message);
+                }
+            }
+
+            function sendToLashinbangBox() {
                 const keys = Object.keys(cart);
                 if (keys.length === 0) {
                     alert("リストが空です。先にスキャンまたは入力を行ってください。");
@@ -911,7 +1068,6 @@ def get_scanner_page():
                         container.appendChild(card);
                     }
                 } catch (e) {
-                    console.error("プレビュー生成例外:", e);
                     container.innerHTML = `<p style='color:#ff6b6b;'>プレビュー生成に失敗: ${e.message}</p>`;
                     alert("プレビュー生成エラー: " + e.message);
                 }
@@ -953,17 +1109,39 @@ def process_jan_code(data: ScanRequest):
     row = cursor.fetchone()
     conn.close()
 
-    existing_title = (
-        row[1]
-        if (row and row[1] and row[1].strip())
-        else f"プライズフィギュア ({cleanText})"
-    )
-    existing_price = (
-        row[3] if (row and row[3] and row[3].strip()) else "買取中!!"
-    )
-    existing_image = row[2] if (row and row[2] and row[2].strip()) else ""
+    if not row:
+      try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR IGNORE INTO unregistered_logs (jan) VALUES (?)",
+            (cleanText,),
+        )
+        conn.commit()
+        conn.close()
+      except Exception as db_err:
+        print(f"⚠️ ローカル未登録ログ保存スキップ: {db_err}")
 
-    if row and row[5]:
+      try:
+        _, unreg_sheet = get_gspread_sheets()
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        unreg_sheet.append_row([cleanText, now_str])
+      except Exception as sheet_err:
+        print(f"⚠️ スプレッドシート未登録リスト保存スキップ: {sheet_err}")
+
+      return JSONResponse(
+          status_code=404,
+          content={
+              "detail": f"商品名が見つかりませんでした (JAN: {cleanText})",
+              "jan": cleanText,
+          },
+      )
+
+    existing_title = row[1] if (row[1] and row[1].strip()) else f"プライズフィギュア ({cleanText})"
+    existing_price = row[3] if (row[3] and row[3].strip()) else "買取中!!"
+    existing_image = row[2] if (row[2] and row[2].strip()) else ""
+
+    if row[5]:
       quote_label = row[5]
       source_url = row[6]
     else:
@@ -972,7 +1150,7 @@ def process_jan_code(data: ScanRequest):
       source_url = meta["source_url"]
 
     return {
-        "source": "sqlite_cache" if row else "unregistered",
+        "source": "sqlite_cache",
         "jan": cleanText,
         "title": existing_title,
         "image_url": existing_image,
@@ -981,6 +1159,8 @@ def process_jan_code(data: ScanRequest):
         "source_url": source_url,
     }
   except Exception as e:
+    if isinstance(e, JSONResponse):
+      raise e
     if isinstance(e, HTTPException):
       raise e
     raise HTTPException(status_code=500, detail=str(e))
