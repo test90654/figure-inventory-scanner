@@ -38,7 +38,7 @@ if not os.path.exists(credential_path):
       f.write(gcp_json_env)
 
 # ==========================================
-# 1. 引用元の自動判定ロジック[cite: 1]
+# 1. 引用元の自動判定ロジック
 # ==========================================
 
 
@@ -127,7 +127,7 @@ def resolve_quote_meta(title: str):
 
 
 # ==========================================
-# 2. DB初期化[cite: 1]
+# 2. DB初期化
 # ==========================================
 
 
@@ -278,7 +278,7 @@ def get_image_bytes(jan: str, target_url: str):
         f.write(jpeg_bytes)
       return jpeg_bytes
     except Exception as img_err:
-      print(f"⚠️️ 画像変換エラー (JAN: {jan}): {img_err}")
+      print(f"⚠️ 画像変換エラー (JAN: {jan}): {img_err}")
       with open(local_file, "wb") as f:
         f.write(res.content)
       return res.content
@@ -641,7 +641,7 @@ def generate_sheet(req: SheetRenderRequest):
 
 
 # ==========================================
-# 3. 画面UI[cite: 1]
+# 3. 画面UI
 # ==========================================
 
 
@@ -1008,7 +1008,6 @@ def get_scanner_page():
                     const data = await res.json();
                     closeModal();
 
-                    // すでにカートにある場合は個数を増やさず情報だけ上書き更新する
                     if (cart[jan]) {
                         cart[jan].title = data.title;
                         cart[jan].imageUrl = data.image_url;
@@ -1148,13 +1147,18 @@ def get_scanner_page():
             window.exportList = function() {
                 const keys = Object.keys(cart);
                 if (keys.length === 0) return alert("リストが空です。");
-                let text = `【 買取持込リスト 】\\n`, totalItems = 0;
+                
+                let lines = ["【 買取持込リスト 】"];
+                let totalItems = 0;
                 keys.forEach(code => {
                     const item = cart[code];
                     totalItems += item.count;
-                    text += `- ${item.title} : ${item.count}個 [JAN: ${item.jan}]\\n`;
+                    lines.push(`- ${item.title} : ${item.count}個 [JAN: ${item.jan}]`);
                 });
-                text += `\\n合計点数: ${totalItems}点\\n`;
+                lines.push("");
+                lines.push(`合計点数: ${totalItems}点`);
+                
+                const text = lines.join("\n");
                 navigator.clipboard.writeText(text).then(() => alert("持込リストをコピーしました！"));
             }
 
@@ -1271,7 +1275,7 @@ def process_jan_code(data: ScanRequest):
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         unreg_sheet.append_row([cleanText, now_str])
       except Exception as sheet_err:
-        print(f"⚠️ スプレッドシート未登録リスト保存スキップ: {sheet_err}")
+        print(f"⚠️️ スプレッドシート未登録リスト保存スキップ: {sheet_err}")
 
       return JSONResponse(
           status_code=404,
