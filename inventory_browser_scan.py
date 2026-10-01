@@ -38,7 +38,7 @@ if not os.path.exists(credential_path):
       f.write(gcp_json_env)
 
 # ==========================================
-# 1. 引用元の自動判定ロジック
+# 1. 引用元の自動判定ロジック[cite: 1]
 # ==========================================
 
 
@@ -127,7 +127,7 @@ def resolve_quote_meta(title: str):
 
 
 # ==========================================
-# 2. DB初期化
+# 2. DB初期化[cite: 1]
 # ==========================================
 
 
@@ -572,7 +572,7 @@ def generate_sheet(req: SheetRenderRequest):
 
 
 # ==========================================
-# 3. 画面UI（r""" を使用してエスケープ崩れを完全防止）
+# 3. 画面UI[cite: 1]
 # ==========================================
 
 
@@ -632,7 +632,7 @@ def get_scanner_page():
             
             /* 不明商品手動登録モーダル */
             #modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); display: none; justify-content: center; align-items: center; z-index: 1000; }
-            .modal-content { background: #222; padding: 20px; border-radius: 8px; width: 90%; max-width: 320px; text-align: left; border: 1px solid #555; }
+            .modal-content { background: #222; padding: 20px; border-radius: 8px; width: 90%; max-width: 320px; text-align: left; border: 1px solid #555; max-height: 90vh; overflow-y: auto; }
             .modal-content h3 { margin-top: 0; color: #ffcc00; font-size: 16px; }
             .modal-content label { font-size: 12px; color: #aaa; display: block; margin-top: 8px; }
             .modal-content input { width: 100%; padding: 8px; margin-top: 4px; background: #333; border: 1px solid #555; color: #fff; border-radius: 4px; box-sizing: border-box; }
@@ -700,6 +700,9 @@ def get_scanner_page():
                 <input type="text" id="modal-jan" readonly style="background: #222; color: #888;">
                 <label>商品名</label>
                 <input type="text" id="modal-title" placeholder="例: フィギュア名など">
+                <label>画像URL (任意)</label>
+                <input type="text" id="modal-image" placeholder="例: 公式サイト等の画像URLを貼り付け">
+
                 <div class="modal-btns">
                     <button class="btn" style="background:#555; margin-top:0;" onclick="closeModal()">キャンセル</button>
                     <button class="btn" style="background:#28a745; margin-top:0;" onclick="submitManualItem()">登録して追加</button>
@@ -866,6 +869,7 @@ def get_scanner_page():
             window.openManualModal = function(jan) {
                 document.getElementById("modal-jan").value = jan;
                 document.getElementById("modal-title").value = "";
+                document.getElementById("modal-image").value = "";
                 document.getElementById("modal-overlay").style.display = "flex";
             }
 
@@ -882,6 +886,7 @@ def get_scanner_page():
             window.submitManualItem = async function() {
                 const jan = document.getElementById("modal-jan").value;
                 const title = document.getElementById("modal-title").value.trim();
+                const imageUrl = document.getElementById("modal-image").value.trim();
 
                 if (!title) {
                     alert("商品名を入力してください。");
@@ -892,7 +897,7 @@ def get_scanner_page():
                     const res = await fetch('/manual_register', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ jan: jan, title: title, price: "買取中!!", image_url: "" })
+                        body: JSON.stringify({ jan: jan, title: title, price: "買取中!!", image_url: imageUrl })
                     });
 
                     if (!res.ok) throw new Error("登録に失敗しました");
