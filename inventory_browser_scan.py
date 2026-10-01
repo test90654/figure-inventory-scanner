@@ -572,13 +572,13 @@ def generate_sheet(req: SheetRenderRequest):
 
 
 # ==========================================
-# 3. 画面UI
+# 3. 画面UI（r""" を使用してエスケープ崩れを完全防止）
 # ==========================================
 
 
 @app.get("/", response_class=HTMLResponse)
 def get_scanner_page():
-  html_content = """
+  html_content = r"""
     <!DOCTYPE html>
     <html lang="ja">
     <head>
@@ -738,7 +738,7 @@ def get_scanner_page():
                 localStorage.setItem(STORAGE_KEY, JSON.stringify(cart));
             }
 
-            function clearCart() {
+            window.clearCart = function() {
                 if (Object.keys(cart).length === 0) return;
                 if (confirm(`この枠（${currentBox}）のリストをすべて消去しますか？`)) {
                     cart = {};
@@ -749,7 +749,6 @@ def get_scanner_page():
                 }
             }
 
-            // グローバルスコープに明示的に登録
             window.toggleScanner = function() {
                 const container = document.getElementById("reader-container");
                 const btn = document.getElementById("scan-toggle-btn");
