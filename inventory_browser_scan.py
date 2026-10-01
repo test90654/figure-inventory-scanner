@@ -38,7 +38,7 @@ if not os.path.exists(credential_path):
       f.write(gcp_json_env)
 
 # ==========================================
-# 1. 引用元（テイ）の自動判定ロジック[cite: 1]
+# 1. 引用元の自動判定ロジック
 # ==========================================
 
 
@@ -127,7 +127,7 @@ def resolve_quote_meta(title: str):
 
 
 # ==========================================
-# 2. DB初期化[cite: 1]
+# 2. DB初期化
 # ==========================================
 
 
@@ -572,7 +572,7 @@ def generate_sheet(req: SheetRenderRequest):
 
 
 # ==========================================
-# 3. 画面UI[cite: 1]
+# 3. 画面UI
 # ==========================================
 
 
@@ -694,8 +694,6 @@ def get_scanner_page():
             <div class="modal-content">
                 <h3>⚠️ 未登録商品（手動登録）</h3>
                 <p style="font-size: 11px; color: #ccc; margin-bottom: 8px;">DBに無いコードのため「未登録リスト」に記録しました。</p>
-                
-                <!-- Googleで調べるボタンを追加 -->
                 <button class="btn btn-google" style="margin-top:0; margin-bottom:8px;" onclick="openGoogleSearch()">🔍 GoogleでこのJANを調べる</button>
 
                 <label>JANコード</label>
@@ -751,7 +749,8 @@ def get_scanner_page():
                 }
             }
 
-            function toggleScanner() {
+            // グローバルスコープに明示的に登録
+            window.toggleScanner = function() {
                 const container = document.getElementById("reader-container");
                 const btn = document.getElementById("scan-toggle-btn");
                 if (!isScanning) {
@@ -765,10 +764,21 @@ def get_scanner_page():
                         { fps: 10, qrbox: { width: 250, height: 100 } }, 
                         onScanSuccess, 
                         () => {}
-                    );
+                    ).catch(err => {
+                        document.getElementById("error-msg").innerText = "カメラ起動エラー: " + err;
+                        isScanning = false;
+                        container.style.display = "none";
+                        btn.innerText = "📷 カメラを起動する";
+                        btn.style.background = "#00ffcc";
+                    });
                 } else {
                     if (html5QrCode) {
                         html5QrCode.stop().then(() => {
+                            container.style.display = "none";
+                            btn.innerText = "📷 カメラを起動する";
+                            btn.style.background = "#00ffcc";
+                            isScanning = false;
+                        }).catch(() => {
                             container.style.display = "none";
                             btn.innerText = "📷 カメラを起動する";
                             btn.style.background = "#00ffcc";
@@ -778,7 +788,7 @@ def get_scanner_page():
                 }
             }
 
-            async function submitManualCode() {
+            window.submitManualCode = async function() {
                 const inputElem = document.getElementById("manual-jan-input");
                 const codeVal = inputElem.value.trim();
                 if (!codeVal) return;
@@ -854,24 +864,23 @@ def get_scanner_page():
                 document.getElementById("result-banner").style.display = "block";
             }
 
-            function openManualModal(jan) {
+            window.openManualModal = function(jan) {
                 document.getElementById("modal-jan").value = jan;
                 document.getElementById("modal-title").value = "";
                 document.getElementById("modal-overlay").style.display = "flex";
             }
 
-            function closeModal() {
+            window.closeModal = function() {
                 document.getElementById("modal-overlay").style.display = "none";
             }
 
-            // Google検索を別タブで開く関数
-            function openGoogleSearch() {
+            window.openGoogleSearch = function() {
                 const jan = document.getElementById("modal-jan").value;
                 const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(jan)}`;
                 window.open(searchUrl, '_blank');
             }
 
-            async function submitManualItem() {
+            window.submitManualItem = async function() {
                 const jan = document.getElementById("modal-jan").value;
                 const title = document.getElementById("modal-title").value.trim();
 
@@ -898,7 +907,7 @@ def get_scanner_page():
                 }
             }
 
-            function sendToLashinbangBox() {
+            window.sendToLashinbangBox = async function() {
                 const keys = Object.keys(cart);
                 if (keys.length === 0) {
                     alert("リストが空です。先にスキャンまたは入力を行ってください。");
@@ -938,13 +947,13 @@ def get_scanner_page():
                 }
             }
 
-            function adjustLastScanned(delta) {
+            window.adjustLastScanned = function(delta) {
                 if (currentBannerJan && cart[currentBannerJan]) {
                     changeQty(currentBannerJan, delta);
                 }
             }
 
-            function changeQty(code, delta) {
+            window.changeQty = function(code, delta) {
                 if (cart[code]) {
                     cart[code].count += delta;
                     if (cart[code].count <= 0) delete cart[code];
@@ -959,7 +968,7 @@ def get_scanner_page():
                 }
             }
 
-            function removeItem(code) {
+            window.removeItem = function(code) {
                 delete cart[code];
                 if (currentBannerJan === code) {
                     document.getElementById("result-banner").style.display = "none";
@@ -1001,7 +1010,7 @@ def get_scanner_page():
                 document.getElementById("total-items").innerText = totalItems;
             }
 
-            function exportList() {
+            window.exportList = function() {
                 const keys = Object.keys(cart);
                 if (keys.length === 0) return alert("リストが空です。");
                 let text = `【 買取持込リスト 】\\n`, totalItems = 0;
@@ -1014,7 +1023,7 @@ def get_scanner_page():
                 navigator.clipboard.writeText(text).then(() => alert("持込リストをコピーしました！"));
             }
 
-            async function generatePreviewsServer() {
+            window.generatePreviewsServer = async function() {
                 const keys = Object.keys(cart);
                 if (keys.length === 0) {
                     alert("リストが空です。先にスキャンを行ってください。");
@@ -1137,8 +1146,14 @@ def process_jan_code(data: ScanRequest):
           },
       )
 
-    existing_title = row[1] if (row[1] and row[1].strip()) else f"プライズフィギュア ({cleanText})"
-    existing_price = row[3] if (row[3] and row[3].strip()) else "買取中!!"
+    existing_title = (
+        row[1]
+        if (row[1] and row[1].strip())
+        else f"プライズフィギュア ({cleanText})"
+    )
+    existing_price = (
+        row[3] if (row[3] and row[3].strip()) else "買取中!!"
+    )
     existing_image = row[2] if (row[2] and row[2].strip()) else ""
 
     if row[5]:
