@@ -839,9 +839,10 @@ def get_scanner_page():
                     btn.style.background = "#ff4444";
                     isScanning = true;
                     html5QrCode = new Html5Qrcode("interactive");
+                    // 💡 発熱対策: fpsを5に下げてCPU負荷を軽減
                     html5QrCode.start(
                         { facingMode: "environment" }, 
-                        { fps: 10, qrbox: { width: 250, height: 100 } }, 
+                        { fps: 5, qrbox: { width: 250, height: 100 } }, 
                         onScanSuccess, 
                         () => {}
                     ).catch(err => {
@@ -885,6 +886,11 @@ def get_scanner_page():
                 lastScannedCode = decodedText;
                 lastScanTime = now;
 
+                // 💡 発熱対策: 読み取り成功時は一時的にスキャン処理をポーズする
+                if (html5QrCode && isScanning) {
+                    html5QrCode.pause();
+                }
+
                 await processAndAddCode(decodedText);
             }
 
@@ -902,9 +908,12 @@ def get_scanner_page():
                         if (res.status === 404) {
                             openManualModal(errData.jan || codeText);
                             document.getElementById("error-msg").innerText = "未登録商品を検出し、未登録リストに記録しました。";
+                            // 読み取り再開
+                            if (html5QrCode && isScanning) html5QrCode.resume();
                             return;
                         }
                         document.getElementById("error-msg").innerText = "未対応コード: " + codeText;
+                        if (html5QrCode && isScanning) html5QrCode.resume();
                         return;
                     }
 
@@ -915,6 +924,11 @@ def get_scanner_page():
                     if (navigator.vibrate) navigator.vibrate(50);
                 } catch (e) {
                     document.getElementById("error-msg").innerText = "通信エラー";
+                } finally {
+                    // 💡 処理完了後にスキャンを再開する
+                    if (html5QrCode && isScanning) {
+                        try { html5QrCode.resume(); } catch(e) {}
+                    }
                 }
             }
 
@@ -949,7 +963,6 @@ def get_scanner_page():
                     } catch (e) {
                         console.error(`画像ダウンロード失敗: ${code}`, e);
                     }
-                    // ブラウザのブロックを防ぐためのわずかなウェイト
                     await new Promise(resolve => setTimeout(resolve, 300));
                 }
                 alert("すべての画像のダウンロード指示を送信しました！");
