@@ -260,7 +260,6 @@ def get_image_bytes(jan: str, target_url: str):
 
   if res and res.status_code == 200:
     try:
-      # WebP等の形式であってもPillowで開いてJPEGに変換して保存する
       image = Image.open(io.BytesIO(res.content)).convert("RGB")
       buf = io.BytesIO()
       image.save(buf, format="JPEG", quality=90)
@@ -985,6 +984,12 @@ def get_scanner_page():
             }
 
             window.removeItem = function(code) {
+                const item = cart[code];
+                const itemName = item ? item.title : "この商品";
+                if (!confirm(`「${itemName}」をリストから削除しますか？`)) {
+                    return;
+                }
+
                 delete cart[code];
                 if (currentBannerJan === code) {
                     document.getElementById("result-banner").style.display = "none";
