@@ -238,7 +238,7 @@ def get_image_bytes(jan: str, target_url: str):
   res = None
   if target_url:
     try:
-      res = requests.get(target_url, headers=headers, timeout=2.5)
+      res = requests.get(target_url, headers=headers, timeout=3.0)
     except Exception:
       res = None
 
@@ -246,7 +246,7 @@ def get_image_bytes(jan: str, target_url: str):
     fixed_url = search_neatz_fallback(jan)
     if fixed_url:
       try:
-        res = requests.get(fixed_url, headers=headers, timeout=2.5)
+        res = requests.get(fixed_url, headers=headers, timeout=3.0)
         if res and res.status_code == 200:
           conn = sqlite3.connect(db_path)
           c = conn.cursor()
@@ -259,9 +259,21 @@ def get_image_bytes(jan: str, target_url: str):
         res = None
 
   if res and res.status_code == 200:
-    with open(local_file, "wb") as f:
-      f.write(res.content)
-    return res.content
+    try:
+      # WebP等の形式であってもPillowで開いてJPEGに変換して保存する
+      image = Image.open(io.BytesIO(res.content)).convert("RGB")
+      buf = io.BytesIO()
+      image.save(buf, format="JPEG", quality=90)
+      jpeg_bytes = buf.getvalue()
+
+      with open(local_file, "wb") as f:
+        f.write(jpeg_bytes)
+      return jpeg_bytes
+    except Exception as img_err:
+      print(f"⚠️ 画像変換エラー (JAN: {jan}): {img_err}")
+      with open(local_file, "wb") as f:
+        f.write(res.content)
+      return res.content
 
   return None
 
@@ -700,7 +712,7 @@ def get_scanner_page():
                 <input type="text" id="modal-jan" readonly style="background: #222; color: #888;">
                 <label>商品名</label>
                 <input type="text" id="modal-title" placeholder="例: フィギュア名など">
-                <label>画像URL (任意)</label>
+                <label>画像URL (任意・WebP可)</label>
                 <input type="text" id="modal-image" placeholder="例: 公式サイト等の画像URLを貼り付け">
 
                 <div class="modal-btns">
