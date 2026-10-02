@@ -24,6 +24,8 @@ jobs:
 
       - name: Create credentials.json from Secrets
         env:
+          # GitHub Secretsに登録した名前に合わせています
+          # ※もしGitHub側の名前が GCP_CREDENTIALS の場合は、ここの secrets.GCP_CREDENTIALS_JSON を secrets.GCP_CREDENTIALS に変更してください
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
         run: |
           echo "$GCP_CREDENTIALS_JSON" > credentials.json
