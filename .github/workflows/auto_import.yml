@@ -24,18 +24,10 @@ jobs:
 
       - name: Create credentials.json from Secrets
         env:
-          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          # 正しいシークレット名 (GCP_CREDENTIALS) に修正
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
         run: |
-          # 1. ファイルに書き出す
-          echo "$GCP_CREDENTIALS_JSON" > credentials.json
-          
-          # 2. デバッグ用にファイルサイズと中身の先頭（または空かどうか）を出力する
-          echo "=== DEBUG: File details ==="
-          ls -l credentials.json
-          echo "=== DEBUG: First 100 characters of credentials.json ==="
-          head -c 100 credentials.json
-          echo ""
-          echo "==========================="
+          echo "$GCP_CREDENTIALS" > credentials.json
 
       - name: Run import script
         run: python import_pasomaru.py
