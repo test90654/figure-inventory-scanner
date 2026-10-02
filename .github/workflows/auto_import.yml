@@ -24,11 +24,18 @@ jobs:
 
       - name: Create credentials.json from Secrets
         env:
-          # GitHub Secretsに登録した名前に合わせています
-          # ※もしGitHub側の名前が GCP_CREDENTIALS の場合は、ここの secrets.GCP_CREDENTIALS_JSON を secrets.GCP_CREDENTIALS に変更してください
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
         run: |
+          # 1. ファイルに書き出す
           echo "$GCP_CREDENTIALS_JSON" > credentials.json
+          
+          # 2. デバッグ用にファイルサイズと中身の先頭（または空かどうか）を出力する
+          echo "=== DEBUG: File details ==="
+          ls -l credentials.json
+          echo "=== DEBUG: First 100 characters of credentials.json ==="
+          head -c 100 credentials.json
+          echo ""
+          echo "==========================="
 
       - name: Run import script
         run: python import_pasomaru.py
