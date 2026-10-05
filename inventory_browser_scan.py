@@ -3,10 +3,11 @@ import io
 import json
 import os
 import sqlite3
+import threading
 import traceback
 import urllib.parse
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 import gspread
@@ -151,6 +152,15 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS stock (
+            jan TEXT NOT NULL,
+            location TEXT NOT NULL DEFAULT '',
+            count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT,
+            PRIMARY KEY (jan, location)
+        )
+    """)
   for col, col_def in [
       ("maker", "TEXT DEFAULT '公式・流通'"),
       ("quote_label", "TEXT DEFAULT '流通 / 商品カタログ'"),
@@ -168,7 +178,7 @@ def init_db():
 init_db()
 
 
-def get_gspread_sheets():
+def get_spreadsheet():
   scope = [
       "https://spreadsheets.google.com/feeds",
       "https://www.googleapis.com/auth/drive",
@@ -178,7 +188,11 @@ def get_gspread_sheets():
   )
   client = gspread.authorize(creds)
   SPREADSHEET_ID = "1CHnUUP_9uiZYaWzbpoaTIjYwyFY5YBAv4x5M3gka2T0"
-  spreadsheet = client.open_by_key(SPREADSHEET_ID)
+  return client.open_by_key(SPREADSHEET_ID)
+
+
+def get_gspread_sheets():
+  spreadsheet = get_spreadsheet()
 
   main_sheet = spreadsheet.sheet1
   try:
@@ -333,6 +347,192 @@ def sync_sheet_to_local():
 
 
 sync_sheet_to_local()
+
+
+# ==========================================
+# 保管在庫（棚卸し）: SQLite + スプレッドシート「保管在庫」へ書き出し
+# ==========================================
+
+STOCK_SHEET_TITLE = "保管在庫"
+STOCK_SHEET_HEADER = ["JAN", "商品名", "数量", "保管場所", "更新日時"]
+
+_stock_sync_lock = threading.Lock()
+_stock_sync_gen = 0
+_stock_sync_gen_lock = threading.Lock()
+
+
+def fetch_stock_rows():
+  conn = sqlite3.connect(db_path)
+  cursor = conn.cursor()
+  cursor.execute("""
+        SELECT s.jan, s.location, s.count, s.updated_at,
+               i.title, i.image_url, i.quote_label, i.source_url
+        FROM stock s LEFT JOIN items i ON s.jan = i.jan
+        WHERE s.count > 0
+        ORDER BY s.location, i.title, s.jan
+    """)
+  rows = cursor.fetchall()
+  conn.close()
+  return [
+      {
+          "jan": r[0],
+          "location": r[1],
+          "count": r[2],
+          "updated_at": r[3] or "",
+          "title": r[4] or f"プライズフィギュア ({r[0]})",
+          "image_url": r[5] or "",
+          "quote_label": r[6] or "流通 / 商品カタログ",
+          "source_url": r[7] or "#",
+      }
+      for r in rows
+  ]
+
+
+def load_stock_from_sheet():
+  """起動時にスプレッドシートの保管在庫をローカルDBへ復元する（Render等の揮発ディスク対策）"""
+  if not os.path.exists(credential_path):
+    return
+  try:
+    try:
+      ws = get_spreadsheet().worksheet(STOCK_SHEET_TITLE)
+    except gspread.exceptions.WorksheetNotFound:
+      return
+    rows = ws.get_all_values()
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM stock")
+    count = 0
+    for row in rows[1:]:
+      if len(row) < 3 or not row[0].strip():
+        continue
+      try:
+        qty = int(row[2])
+      except ValueError:
+        continue
+      if qty <= 0:
+        continue
+      location = row[3].strip() if len(row) > 3 else ""
+      updated_at = row[4].strip() if len(row) > 4 else ""
+      cursor.execute(
+          "INSERT OR REPLACE INTO stock (jan, location, count, updated_at)"
+          " VALUES (?, ?, ?, ?)",
+          (row[0].strip(), location, qty, updated_at),
+      )
+      count += 1
+    conn.commit()
+    conn.close()
+    print(f"📦 保管在庫を {count} 件復元しました。")
+  except Exception as e:
+    print(f"⚠️ 保管在庫の復元スキップ: {e}")
+
+
+load_stock_from_sheet()
+
+
+def _write_stock_sheet(gen: int):
+  with _stock_sync_lock:
+    # 後続の書き出しが予約済みなら、そちらに任せて無駄な書き込みを省く
+    if gen != _stock_sync_gen:
+      return
+    if not os.path.exists(credential_path):
+      return
+    try:
+      spreadsheet = get_spreadsheet()
+      try:
+        ws = spreadsheet.worksheet(STOCK_SHEET_TITLE)
+      except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(
+            title=STOCK_SHEET_TITLE, rows="1000", cols="5"
+        )
+
+      values = [STOCK_SHEET_HEADER] + [
+          [s["jan"], s["title"], s["count"], s["location"], s["updated_at"]]
+          for s in fetch_stock_rows()
+      ]
+      if ws.row_count < len(values):
+        ws.add_rows(len(values) - ws.row_count + 100)
+      ws.update(values=values, range_name="A1")
+      ws.batch_clear([f"A{len(values) + 1}:E{ws.row_count}"])
+    except Exception as e:
+      print(f"⚠️ 保管在庫のスプレッドシート書き出しスキップ: {e}")
+
+
+def schedule_stock_sheet_sync(background_tasks: BackgroundTasks):
+  global _stock_sync_gen
+  with _stock_sync_gen_lock:
+    _stock_sync_gen += 1
+    gen = _stock_sync_gen
+  background_tasks.add_task(_write_stock_sheet, gen)
+
+
+class StockAdjustRequest(BaseModel):
+  jan: str
+  location: str = ""
+  delta: int = 1
+
+
+class StockDeleteRequest(BaseModel):
+  jan: str
+  location: str = ""
+
+
+@app.get("/api/stock")
+def get_stock():
+  return {"items": fetch_stock_rows()}
+
+
+@app.post("/api/stock/adjust")
+def adjust_stock(data: StockAdjustRequest, background_tasks: BackgroundTasks):
+  jan = "".join(filter(str.isdigit, data.jan))
+  if not jan:
+    raise HTTPException(status_code=400, detail="JANコードが不正です")
+  location = data.location.strip()
+  now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+  conn = sqlite3.connect(db_path)
+  cursor = conn.cursor()
+  cursor.execute(
+      """
+        INSERT INTO stock (jan, location, count, updated_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT(jan, location) DO UPDATE SET
+            count = count + excluded.count, updated_at = excluded.updated_at
+    """,
+      (jan, location, data.delta, now_str),
+  )
+  cursor.execute(
+      "DELETE FROM stock WHERE jan = ? AND location = ? AND count <= 0",
+      (jan, location),
+  )
+  cursor.execute(
+      "SELECT count FROM stock WHERE jan = ? AND location = ?", (jan, location)
+  )
+  row = cursor.fetchone()
+  conn.commit()
+  conn.close()
+
+  schedule_stock_sheet_sync(background_tasks)
+  return {
+      "jan": jan,
+      "location": location,
+      "count": row[0] if row else 0,
+      "updated_at": now_str,
+  }
+
+
+@app.post("/api/stock/delete")
+def delete_stock(data: StockDeleteRequest, background_tasks: BackgroundTasks):
+  conn = sqlite3.connect(db_path)
+  cursor = conn.cursor()
+  cursor.execute(
+      "DELETE FROM stock WHERE jan = ? AND location = ?",
+      (data.jan, data.location.strip()),
+  )
+  conn.commit()
+  conn.close()
+
+  schedule_stock_sheet_sync(background_tasks)
+  return {"status": "deleted"}
 
 
 @app.get("/proxy_image")
@@ -714,13 +914,35 @@ def get_scanner_page():
             #preview-container { display: flex; flex-direction: column; align-items: center; gap: 20px; margin-top: 15px; }
             .preview-card { background: #1e1e1e; padding: 12px; border-radius: 8px; border: 1px solid #444; width: 100%; max-width: 380px; box-sizing: border-box; text-align: left; }
             .preview-img { width: 100%; height: auto; border-radius: 4px; border: 1px solid #555; display: block; }
+
+            .mode-tabs { display: flex; max-width: 380px; margin: 0 auto 10px auto; background: #1e1e1e; border-radius: 8px; padding: 4px; gap: 4px; border: 1px solid #333; }
+            .mode-tab { flex: 1; background: transparent; color: #aaa; border: none; padding: 10px 6px; border-radius: 6px; font-weight: bold; font-size: 14px; cursor: pointer; }
+            .mode-tab.active { background: #00ffcc; color: #000; }
+            .mode-tab.active.stock { background: #f1c40f; }
+            .location-box { max-width: 380px; margin: 0 auto 10px auto; background: #2a2410; border: 1px solid #f1c40f; padding: 8px 10px; border-radius: 8px; display: flex; align-items: center; gap: 8px; box-sizing: border-box; font-size: 12px; color: #f1c40f; }
+            .location-box input { flex-grow: 1; background: #2a2a2a; color: #fff; border: 1px solid #555; padding: 7px 9px; border-radius: 6px; font-size: 14px; min-width: 0; }
+            .stock-filter { width: 100%; box-sizing: border-box; background: #2a2a2a; color: #fff; border: 1px solid #555; padding: 7px 9px; border-radius: 6px; font-size: 13px; margin-bottom: 6px; }
+            .item-location { display: inline-block; font-size: 10px; color: #000; background: #f1c40f; border-radius: 3px; padding: 0 5px; margin-top: 3px; }
+            .item-location.none { background: #555; color: #ddd; }
+            .btn-stock-export { background: #f1c40f; color: #000; }
+            .btn-stock-csv { background: #555; color: #fff; }
+            body.mode-stock .result-banner { background: #3a3110; border-color: #f1c40f; color: #fff3cd; }
         </style>
     </head>
     <body>
         <h2>📦 買取インベントリ</h2>
         <div id="box-tag-display" class="box-tag">作業枠: メイン</div>
         <p>カメラにかざすか、バーコードを手打ち入力</p>
-        
+
+        <div class="mode-tabs">
+            <button id="tab-cart" class="mode-tab active" onclick="setMode('cart')">🛒 持込リスト</button>
+            <button id="tab-stock" class="mode-tab stock" onclick="setMode('stock')">🗄️ 保管在庫</button>
+        </div>
+        <div id="location-box" class="location-box" style="display:none;">
+            <span style="white-space:nowrap;">📍 保管場所</span>
+            <input type="text" id="stock-location-input" placeholder="例: 押入れ箱A（空欄可）" oninput="saveLocation()">
+        </div>
+
         <button id="scan-toggle-btn" class="btn-toggle" onclick="toggleScanner()">📷 カメラを起動する</button>
         <div id="reader-container"><div id="interactive" style="width: 100%;"></div></div>
 
@@ -748,7 +970,21 @@ def get_scanner_page():
         </div>
         <div id="error-msg" class="error"></div>
 
-        <div class="list-section">
+        <div id="stock-section" class="list-section" style="display:none;">
+            <div class="summary-box">
+                <div>在庫: <strong id="stock-kinds" style="color:#f1c40f; font-size:18px;">0</strong> 種 / <strong id="stock-total" style="color:#f1c40f; font-size:18px;">0</strong> 点</div>
+                <button class="btn-clear" onclick="loadStock()">🔄 再読込</button>
+            </div>
+            <h3><span>🗄️ 保管在庫一覧</span></h3>
+            <input type="text" id="stock-filter" class="stock-filter" placeholder="🔍 商品名・JAN・保管場所で絞り込み" oninput="renderStock()">
+            <div id="stock-items"><p style="color: #777; text-align: center; margin: 8px 0;">読み込み中...</p></div>
+
+            <button class="btn btn-stock-export" onclick="exportStockText()">📋 在庫リストをテキストでコピー</button>
+            <button class="btn btn-stock-csv" onclick="downloadStockCsv()">⬇️ 在庫をCSVでダウンロード</button>
+            <div style="font-size: 10px; color: #888; margin-top: 6px;">※ 在庫はサーバーに保存され、スプレッドシートの「保管在庫」シートにも自動で書き出されます。</div>
+        </div>
+
+        <div id="cart-section" class="list-section">
             <div class="summary-box">
                 <div>登録点数: <strong id="total-items" style="color:#00ffcc; font-size:18px;">0</strong> 点</div>
                 <button class="btn-clear" onclick="clearCart()">🗑 リストを空にする</button>
@@ -800,10 +1036,53 @@ def get_scanner_page():
             let lastScannedCode = "";
             let lastScanTime = 0;
 
+            // 'cart' = 持込リスト, 'stock' = 保管在庫
+            const MODE_KEY = "figure_scanner_mode";
+            const LOCATION_KEY = "figure_scanner_stock_location";
+            let currentMode = "cart";
+            let stockItems = [];
+            let bannerLocation = "";
+            let modalIsEdit = false;
+
+            function escapeHtml(s) {
+                return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+            }
+
+            function lsGet(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
+            function lsSet(key, val) { try { localStorage.setItem(key, val); } catch (e) {} }
+
+            window.setMode = function(mode) {
+                currentMode = mode === "stock" ? "stock" : "cart";
+                lsSet(MODE_KEY, currentMode);
+                const isStock = currentMode === "stock";
+                document.body.classList.toggle("mode-stock", isStock);
+                document.getElementById("tab-cart").classList.toggle("active", !isStock);
+                document.getElementById("tab-stock").classList.toggle("active", isStock);
+                document.getElementById("location-box").style.display = isStock ? "flex" : "none";
+                document.getElementById("stock-section").style.display = isStock ? "block" : "none";
+                document.getElementById("cart-section").style.display = isStock ? "none" : "block";
+                document.getElementById("preview-container").style.display = isStock ? "none" : "flex";
+                document.getElementById("box-tag-display").style.display = isStock ? "none" : "inline-block";
+                document.getElementById("result-banner").style.display = "none";
+                document.getElementById("error-msg").innerText = "";
+                currentBannerJan = "";
+                if (isStock) loadStock();
+            }
+
+            window.saveLocation = function() {
+                lsSet(LOCATION_KEY, document.getElementById("stock-location-input").value);
+            }
+
+            function getLocation() {
+                return document.getElementById("stock-location-input").value.trim();
+            }
+
             window.addEventListener("DOMContentLoaded", () => {
                 if (currentBox !== 'default') {
                     document.getElementById("box-tag-display").innerText = "作業枠 (箱番号): " + currentBox;
                 }
+                document.getElementById("stock-location-input").value = lsGet(LOCATION_KEY) || "";
+                setMode(urlParams.get('mode') || lsGet(MODE_KEY) || "cart");
                 const saved = localStorage.getItem(STORAGE_KEY);
                 if (saved) {
                     try {
@@ -918,7 +1197,11 @@ def get_scanner_page():
                     }
 
                     const data = await res.json();
-                    addOrUpdateCartItem(data);
+                    if (currentMode === "stock") {
+                        await addToStock(data);
+                    } else {
+                        addOrUpdateCartItem(data);
+                    }
                     document.getElementById("error-msg").innerText = "";
 
                     if (navigator.vibrate) navigator.vibrate(50);
@@ -1003,7 +1286,8 @@ def get_scanner_page():
                 document.getElementById("modal-title").value = existingTitle;
                 document.getElementById("modal-image").value = existingImage;
                 document.getElementById("modal-file").value = "";
-                
+                modalIsEdit = !!existingTitle;
+
                 if (existingTitle) {
                     document.getElementById("modal-heading").innerText = "🖼️ 商品画像の再登録 / 修正";
                     document.getElementById("modal-desc").innerText = "画像URLの変更、またはファイルから直接画像をアップロードできます。";
@@ -1060,6 +1344,16 @@ def get_scanner_page():
 
                     const data = await res.json();
                     closeModal();
+
+                    if (currentMode === "stock") {
+                        if (modalIsEdit) {
+                            await loadStock();
+                        } else {
+                            await addToStock(data);
+                        }
+                        document.getElementById("error-msg").innerText = "画像・情報を更新して在庫に反映しました！";
+                        return;
+                    }
 
                     if (cart[jan]) {
                         cart[jan].title = data.title;
@@ -1126,6 +1420,10 @@ def get_scanner_page():
             }
 
             window.adjustLastScanned = function(delta) {
+                if (currentMode === "stock") {
+                    if (currentBannerJan) changeStockQty(currentBannerJan, bannerLocation, delta);
+                    return;
+                }
                 if (currentBannerJan && cart[currentBannerJan]) {
                     changeQty(currentBannerJan, delta);
                 }
@@ -1272,6 +1570,225 @@ def get_scanner_page():
                     container.innerHTML = `<p style='color:#ff6b6b;'>プレビュー生成に失敗: ${e.message}</p>`;
                     alert("プレビュー生成エラー: " + e.message);
                 }
+            }
+
+            // ==========================================
+            // 保管在庫モード
+            // ==========================================
+
+            function findStock(jan, location) {
+                return stockItems.find(s => s.jan === jan && s.location === location);
+            }
+
+            window.loadStock = async function() {
+                try {
+                    const res = await fetch('/api/stock');
+                    if (!res.ok) throw new Error("HTTP " + res.status);
+                    const data = await res.json();
+                    stockItems = data.items || [];
+                    renderStock();
+                } catch (e) {
+                    document.getElementById("stock-items").innerHTML = `<p style="color:#ff6b6b; text-align:center;">在庫の読み込みに失敗しました: ${escapeHtml(e.message)}</p>`;
+                }
+            }
+
+            async function postStockAdjust(jan, location, delta) {
+                const res = await fetch('/api/stock/adjust', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ jan, location, delta })
+                });
+                if (!res.ok) throw new Error("在庫の更新に失敗しました");
+                return await res.json();
+            }
+
+            async function addToStock(data) {
+                const location = getLocation();
+                const result = await postStockAdjust(data.jan, location, 1);
+                const existing = findStock(data.jan, location);
+                const info = {
+                    jan: data.jan,
+                    location: location,
+                    count: result.count,
+                    updated_at: result.updated_at,
+                    title: data.title || (existing && existing.title) || "",
+                    image_url: data.image_url || (existing && existing.image_url) || "",
+                    quote_label: data.quote_label || "流通 / 商品カタログ",
+                    source_url: data.source_url || "#"
+                };
+                if (existing) {
+                    Object.assign(existing, info);
+                } else {
+                    stockItems.push(info);
+                }
+                renderStock();
+                showStockBanner(info);
+            }
+
+            function showStockBanner(item) {
+                currentBannerJan = item.jan;
+                bannerLocation = item.location;
+                document.getElementById("res-title").innerText = item.title;
+                document.getElementById("res-jan").innerText = "コード: " + item.jan + (item.location ? " ／ 📍" + item.location : "");
+                document.getElementById("res-quote").innerText = "保管在庫に追加しました";
+                document.getElementById("res-count").innerText = item.count;
+                document.getElementById("res-img").src = `/proxy_image?jan=${encodeURIComponent(item.jan)}&url=${encodeURIComponent(item.image_url || '')}&t=` + Date.now();
+                document.getElementById("result-banner").style.display = "block";
+            }
+
+            window.changeStockQty = async function(jan, location, delta) {
+                const item = findStock(jan, location);
+                if (item && item.count + delta <= 0) {
+                    if (!confirm(`「${item.title}」の在庫を0にして一覧から削除しますか？`)) return;
+                }
+                try {
+                    const result = await postStockAdjust(jan, location, delta);
+                    if (result.count <= 0) {
+                        stockItems = stockItems.filter(s => !(s.jan === jan && s.location === location));
+                    } else if (item) {
+                        item.count = result.count;
+                        item.updated_at = result.updated_at;
+                    } else {
+                        await loadStock();
+                    }
+                    renderStock();
+                    if (currentBannerJan === jan && bannerLocation === location) {
+                        if (result.count > 0) {
+                            document.getElementById("res-count").innerText = result.count;
+                        } else {
+                            document.getElementById("result-banner").style.display = "none";
+                        }
+                    }
+                } catch (e) {
+                    alert("エラー: " + e.message);
+                }
+            }
+
+            async function removeStockItem(jan, location) {
+                const item = findStock(jan, location);
+                const name = item ? item.title : "この商品";
+                if (!confirm(`「${name}」を保管在庫から削除しますか？`)) return;
+                try {
+                    const res = await fetch('/api/stock/delete', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ jan, location })
+                    });
+                    if (!res.ok) throw new Error("削除に失敗しました");
+                    stockItems = stockItems.filter(s => !(s.jan === jan && s.location === location));
+                    if (currentBannerJan === jan && bannerLocation === location) {
+                        document.getElementById("result-banner").style.display = "none";
+                    }
+                    renderStock();
+                } catch (e) {
+                    alert("エラー: " + e.message);
+                }
+            }
+
+            function getFilteredStock() {
+                const q = document.getElementById("stock-filter").value.trim().toLowerCase();
+                if (!q) return stockItems;
+                return stockItems.filter(s =>
+                    (s.title || "").toLowerCase().includes(q) ||
+                    s.jan.includes(q) ||
+                    (s.location || "").toLowerCase().includes(q)
+                );
+            }
+
+            window.renderStock = function() {
+                const container = document.getElementById("stock-items");
+                const items = getFilteredStock();
+
+                let total = 0;
+                stockItems.forEach(s => total += s.count);
+                document.getElementById("stock-kinds").innerText = stockItems.length;
+                document.getElementById("stock-total").innerText = total;
+
+                if (items.length === 0) {
+                    container.innerHTML = `<p style="color: #777; text-align: center; margin: 8px 0;">${stockItems.length === 0 ? "まだ在庫は登録されていません" : "該当する在庫がありません"}</p>`;
+                    return;
+                }
+
+                container.innerHTML = items.map(item => {
+                    const thumbUrl = `/proxy_image?jan=${encodeURIComponent(item.jan)}&url=${encodeURIComponent(item.image_url || '')}`;
+                    const loc = item.location
+                        ? `<span class="item-location">📍 ${escapeHtml(item.location)}</span>`
+                        : `<span class="item-location none">場所未設定</span>`;
+                    const attrs = `data-jan="${escapeHtml(item.jan)}" data-location="${escapeHtml(item.location)}"`;
+                    return `
+                        <div class="item-row">
+                            <img src="${thumbUrl}" class="item-thumb" loading="lazy" onerror="this.style.background='#442222';">
+                            <div class="item-info">
+                                <div class="item-title">${escapeHtml(item.title)}</div>
+                                <div class="item-jan">コード: ${escapeHtml(item.jan)}</div>
+                                ${loc}
+                            </div>
+                            <div class="qty-control">
+                                <button class="qty-btn" data-act="dec" ${attrs}>-</button>
+                                <span class="qty-val">${item.count}</span>
+                                <button class="qty-btn" data-act="inc" ${attrs}>+</button>
+                                <button class="img-edit-btn" data-act="img" ${attrs}>画像</button>
+                                <button class="del-btn" data-act="del" ${attrs}>×</button>
+                            </div>
+                        </div>`;
+                }).join("");
+            }
+
+            document.getElementById("stock-items").addEventListener("click", (ev) => {
+                const btn = ev.target.closest("button[data-act]");
+                if (!btn) return;
+                const jan = btn.dataset.jan;
+                const location = btn.dataset.location;
+                switch (btn.dataset.act) {
+                    case "inc": changeStockQty(jan, location, 1); break;
+                    case "dec": changeStockQty(jan, location, -1); break;
+                    case "del": removeStockItem(jan, location); break;
+                    case "img": {
+                        const item = findStock(jan, location);
+                        if (item) openManualModal(jan, item.title, item.image_url || "");
+                        break;
+                    }
+                }
+            });
+
+            window.exportStockText = function() {
+                if (stockItems.length === 0) return alert("在庫が空です。");
+                const groups = {};
+                stockItems.forEach(s => {
+                    const key = s.location || "場所未設定";
+                    (groups[key] = groups[key] || []).push(s);
+                });
+                let lines = ["【 保管在庫リスト 】"];
+                let total = 0;
+                Object.keys(groups).forEach(loc => {
+                    lines.push("");
+                    lines.push(`■ ${loc}`);
+                    groups[loc].forEach(s => {
+                        total += s.count;
+                        lines.push(`- ${s.title} : ${s.count}個 [JAN: ${s.jan}]`);
+                    });
+                });
+                lines.push("");
+                lines.push(`合計: ${stockItems.length}種 / ${total}点`);
+                navigator.clipboard.writeText(lines.join("\n")).then(() => alert("在庫リストをコピーしました！"));
+            }
+
+            window.downloadStockCsv = function() {
+                if (stockItems.length === 0) return alert("在庫が空です。");
+                const esc = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+                const rows = [["JAN", "商品名", "数量", "保管場所", "更新日時"]].concat(
+                    stockItems.map(s => [s.jan, s.title, s.count, s.location, s.updated_at || ""])
+                );
+                const csv = "﻿" + rows.map(r => r.map(esc).join(",")).join("\r\n");
+                const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+                const a = document.createElement("a");
+                a.href = URL.createObjectURL(blob);
+                const d = new Date();
+                a.download = `stock_${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}.csv`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(a.href);
             }
         </script>
     </body>
