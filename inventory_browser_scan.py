@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 import traceback
 import unicodedata
 import urllib.parse
@@ -17,6 +18,8 @@ from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel
 import requests
 from playwright.sync_api import sync_playwright
+from mercari_search import build_url as build_mercari_url
+from mercari_search import price_summary, search_mercari
 
 app = FastAPI(title="Figure Inventory Cloud Edition")
 
@@ -722,6 +725,44 @@ def bulk_add_box(data: BulkAddRequest):
   return {"status": "completed", "results": results}
 
 
+# メルカリ相場検索: ブラウザ起動が重いので同時実行は1件に絞り、結果は1時間キャッシュする
+MERCARI_CACHE_TTL = 3600
+mercari_cache = {}
+mercari_lock = threading.Lock()
+
+
+@app.get("/api/mercari_price")
+def mercari_price(q: str, status: str = "sold_out"):
+  q = q.strip()
+  if not q:
+    raise HTTPException(status_code=400, detail="q is required")
+  if status not in ("sold_out", "on_sale"):
+    raise HTTPException(status_code=400, detail="invalid status")
+
+  key = (q, status)
+  cached = mercari_cache.get(key)
+  if cached and time.time() - cached["fetched_at"] < MERCARI_CACHE_TTL:
+    return cached
+
+  with mercari_lock:
+    try:
+      items = search_mercari(q, pages=1, status=status, log=lambda *_: None)
+    except Exception as e:
+      traceback.print_exc()
+      raise HTTPException(status_code=502, detail=str(e))
+
+  result = {
+      "query": q,
+      "status": status,
+      "summary": price_summary(items),
+      "items": items[:20],
+      "search_url": build_mercari_url(q, status=status),
+      "fetched_at": time.time(),
+  }
+  mercari_cache[key] = result
+  return result
+
+
 @app.post("/manual_register")
 async def manual_register(
     jan: str = Form(""),
@@ -981,7 +1022,22 @@ def get_scanner_page():
             .img-edit-btn { background: #e67e22; color: white; border: none; border-radius: 4px; padding: 4px 5px; cursor: pointer; font-size: 10px; }
             .img-edit-btn:hover { background: #d35400; }
             .del-btn { background: #cc3333; color: white; border: none; border-radius: 4px; padding: 4px 5px; cursor: pointer; font-size: 10px; }
-            
+            .mercari-btn { background: #e8384f; color: white; border: none; border-radius: 4px; padding: 4px 5px; cursor: pointer; font-size: 10px; }
+            .mercari-btn:hover { background: #c92a40; }
+
+            #mercari-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); display: none; justify-content: center; align-items: center; z-index: 1000; }
+            .mercari-tabs { display: flex; gap: 6px; margin-bottom: 8px; }
+            .mercari-tabs button { flex: 1; background: #333; color: #aaa; border: 1px solid #555; border-radius: 4px; padding: 5px; font-size: 11px; cursor: pointer; }
+            .mercari-tabs button.active { background: #e8384f; color: #fff; border-color: #e8384f; }
+            .mercari-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 8px 0; text-align: center; }
+            .mercari-stats div { background: #333; border-radius: 4px; padding: 6px 2px; }
+            .mercari-stats small { display: block; font-size: 10px; color: #aaa; }
+            .mercari-stats b { font-size: 14px; color: #fff; }
+            .mercari-list a { display: flex; gap: 6px; align-items: center; padding: 4px 0; border-bottom: 1px solid #333; color: #ddd; text-decoration: none; font-size: 11px; }
+            .mercari-list img { width: 36px; height: 36px; object-fit: cover; border-radius: 3px; flex-shrink: 0; background: #333; }
+            .mercari-list .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            .mercari-list .p { color: #ffcc00; font-weight: bold; white-space: nowrap; }
+
             .summary-box { background: #222; border: 1px solid #444; padding: 10px; border-radius: 6px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; font-size: 14px; }
             .btn { background: #007bff; color: white; border: none; padding: 10px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; width: 100%; margin-top: 8px; font-weight: bold; }
             .btn-export { background: #28a745; }
@@ -1115,6 +1171,24 @@ def get_scanner_page():
                 <div class="modal-btns">
                     <button class="btn" style="background:#555; margin-top:0;" onclick="closeModal()">キャンセル</button>
                     <button class="btn" style="background:#28a745; margin-top:0;" onclick="submitManualItem()">登録して追加</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- メルカリ相場モーダル -->
+        <div id="mercari-overlay" onclick="if (event.target === this) closeMercariModal()">
+            <div class="modal-content">
+                <h3>💴 メルカリ相場</h3>
+                <label>検索キーワード</label>
+                <input type="text" id="mercari-query" onkeydown="if (event.key === 'Enter') fetchMercariPrice()">
+                <div class="mercari-tabs" style="margin-top:8px;">
+                    <button id="mercari-tab-sold_out" class="active" onclick="setMercariStatus('sold_out')">売り切れ（成約）</button>
+                    <button id="mercari-tab-on_sale" onclick="setMercariStatus('on_sale')">販売中</button>
+                </div>
+                <div id="mercari-result" style="font-size:12px; color:#ccc;"></div>
+                <div class="modal-btns">
+                    <button class="btn" style="background:#555; margin-top:0;" onclick="closeMercariModal()">閉じる</button>
+                    <button class="btn" style="background:#e8384f; margin-top:0;" onclick="fetchMercariPrice()">再検索</button>
                 </div>
             </div>
         </div>
@@ -1400,6 +1474,66 @@ def get_scanner_page():
                 document.getElementById("modal-overlay").style.display = "none";
             }
 
+            // ===== メルカリ相場 =====
+            let mercariStatus = "sold_out";
+            let mercariReqId = 0;
+            const yen = n => (n == null ? "-" : "¥" + Number(n).toLocaleString());
+
+            window.openMercariModal = function(title) {
+                document.getElementById("mercari-query").value = title || "";
+                document.getElementById("mercari-overlay").style.display = "flex";
+                fetchMercariPrice();
+            }
+
+            window.closeMercariModal = function() {
+                document.getElementById("mercari-overlay").style.display = "none";
+                mercariReqId++;
+            }
+
+            window.setMercariStatus = function(status) {
+                mercariStatus = status;
+                ["sold_out", "on_sale"].forEach(s =>
+                    document.getElementById(`mercari-tab-${s}`).classList.toggle("active", s === status));
+                fetchMercariPrice();
+            }
+
+            window.fetchMercariPrice = async function() {
+                const q = document.getElementById("mercari-query").value.trim();
+                const box = document.getElementById("mercari-result");
+                if (!q) { box.innerHTML = "キーワードを入力してください。"; return; }
+                const reqId = ++mercariReqId;
+                box.innerHTML = "⏳ メルカリを検索中...（10〜30秒ほどかかります）";
+                try {
+                    const res = await fetch(`/api/mercari_price?q=${encodeURIComponent(q)}&status=${mercariStatus}`);
+                    if (reqId !== mercariReqId) return;
+                    if (!res.ok) throw new Error((await res.json()).detail || res.status);
+                    const data = await res.json();
+                    const s = data.summary;
+                    if (!s.count) {
+                        box.innerHTML = `該当する商品がありませんでした。<br><a href="${escapeHtml(data.search_url)}" target="_blank" rel="noopener" style="color:#38bdf8;">メルカリで開く</a>`;
+                        return;
+                    }
+                    const list = data.items.map(i => `
+                        <a href="${escapeHtml(i.link)}" target="_blank" rel="noopener">
+                            <img src="${escapeHtml(i.thumb)}" loading="lazy" onerror="this.style.visibility='hidden'">
+                            <span class="t">${escapeHtml(i.title)}</span>
+                            <span class="p">${yen(i.price)}</span>
+                        </a>`).join("");
+                    box.innerHTML = `
+                        <div class="mercari-stats">
+                            <div><small>最安</small><b>${yen(s.min)}</b></div>
+                            <div><small>中央値</small><b>${yen(s.median)}</b></div>
+                            <div><small>最高</small><b>${yen(s.max)}</b></div>
+                        </div>
+                        <div style="font-size:10px; color:#888; margin-bottom:4px;">${s.count}件から集計 / 平均 ${yen(s.average)} ・
+                            <a href="${escapeHtml(data.search_url)}" target="_blank" rel="noopener" style="color:#38bdf8;">メルカリで開く</a></div>
+                        <div class="mercari-list">${list}</div>`;
+                } catch (e) {
+                    if (reqId !== mercariReqId) return;
+                    box.innerHTML = `⚠️ 取得に失敗しました: ${escapeHtml(e.message)}`;
+                }
+            }
+
             window.openGoogleSearch = function() {
                 const jan = document.getElementById("modal-jan").value.trim();
                 const q = jan || document.getElementById("modal-title").value.trim();
@@ -1585,6 +1719,7 @@ def get_scanner_page():
                             <span class="qty-val">${item.count}</span>
                             <button class="qty-btn" onclick="changeQty('${code}', 1)">+</button>
                             <button class="img-edit-btn" onclick="openEditImageModal('${code}')">画像</button>
+                            <button class="mercari-btn" onclick="openMercariModal(cart['${code}'].title)">相場</button>
                             <button class="del-btn" onclick="removeItem('${code}')">×</button>
                         </div>
                     `;
@@ -1826,6 +1961,7 @@ def get_scanner_page():
                                 <span class="qty-val">${item.count}</span>
                                 <button class="qty-btn" data-act="inc" ${attrs}>+</button>
                                 <button class="img-edit-btn" data-act="img" ${attrs}>画像</button>
+                                <button class="mercari-btn" data-act="mercari" ${attrs}>相場</button>
                                 <button class="del-btn" data-act="del" ${attrs}>×</button>
                             </div>
                         </div>`;
@@ -1844,6 +1980,11 @@ def get_scanner_page():
                     case "img": {
                         const item = findStock(jan, location);
                         if (item) openManualModal(jan, item.title, item.image_url || "");
+                        break;
+                    }
+                    case "mercari": {
+                        const item = findStock(jan, location);
+                        if (item) openMercariModal(item.title);
                         break;
                     }
                 }

@@ -3,3 +3,4 @@ inventory.db
 img_cache/
 credentials.json
 .env
+*.csv
