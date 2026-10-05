@@ -5,6 +5,7 @@ import os
 import sqlite3
 import threading
 import traceback
+import unicodedata
 import urllib.parse
 from bs4 import BeautifulSoup
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
@@ -535,6 +536,81 @@ def delete_stock(data: StockDeleteRequest, background_tasks: BackgroundTasks):
   return {"status": "deleted"}
 
 
+# ==========================================
+# 商品名検索 / バーコード無し商品の独自コード発行
+# ==========================================
+
+# 「20」始まりのEAN-13は店舗内利用向けの予約範囲のため、市販品のJANと衝突しない
+INTERNAL_CODE_PREFIX = "20"
+
+
+def normalize_for_search(text: str) -> str:
+  """全角/半角・大文字/小文字・ひらがな/カタカナの違いを吸収する"""
+  t = unicodedata.normalize("NFKC", text or "").lower()
+  return "".join(
+      chr(ord(c) + 0x60) if "ぁ" <= c <= "ゖ" else c for c in t
+  )
+
+
+def ean13_check_digit(body12: str) -> str:
+  total = sum(int(d) * (3 if i % 2 else 1) for i, d in enumerate(body12))
+  return str((10 - total % 10) % 10)
+
+
+def generate_internal_code(cursor) -> str:
+  cursor.execute(
+      "SELECT jan FROM items WHERE jan LIKE ? AND length(jan) = 13",
+      (INTERNAL_CODE_PREFIX + "%",),
+  )
+  max_seq = 0
+  for (jan,) in cursor.fetchall():
+    if jan.isdigit():
+      max_seq = max(max_seq, int(jan[len(INTERNAL_CODE_PREFIX):12]))
+  body = INTERNAL_CODE_PREFIX + str(max_seq + 1).zfill(
+      12 - len(INTERNAL_CODE_PREFIX)
+  )
+  return body + ean13_check_digit(body)
+
+
+@app.get("/api/search_items")
+def search_items(q: str = "", limit: int = 30):
+  keywords = [normalize_for_search(k) for k in q.split() if k.strip()]
+  if not keywords:
+    return {"items": []}
+
+  conn = sqlite3.connect(db_path)
+  cursor = conn.cursor()
+  cursor.execute(
+      "SELECT jan, title, image_url, price, quote_label, source_url FROM items"
+  )
+  rows = cursor.fetchall()
+  conn.close()
+
+  results = []
+  for r in rows:
+    haystack = normalize_for_search(f"{r[1] or ''} {r[0]}")
+    if all(k in haystack for k in keywords):
+      title = r[1] or f"プライズフィギュア ({r[0]})"
+      meta = (
+          {"quote_label": r[4], "source_url": r[5]}
+          if r[4]
+          else resolve_quote_meta(title)
+      )
+      results.append({
+          "jan": r[0],
+          "title": title,
+          "image_url": r[2] or "",
+          "price": r[3] or "買取中!!",
+          "quote_label": meta["quote_label"],
+          "source_url": meta["source_url"] or "#",
+          "internal": r[0].startswith(INTERNAL_CODE_PREFIX)
+          and len(r[0]) == 13,
+      })
+      if len(results) >= limit:
+        break
+  return {"items": results}
+
+
 @app.get("/proxy_image")
 def proxy_image(url: str = None, jan: str = None, refresh: int = 0):
   if refresh == 1 and jan:
@@ -648,7 +724,7 @@ def bulk_add_box(data: BulkAddRequest):
 
 @app.post("/manual_register")
 async def manual_register(
-    jan: str = Form(...),
+    jan: str = Form(""),
     title: str = Form(...),
     price: str = Form("買取中!!"),
     image_url: str = Form(""),
@@ -659,6 +735,9 @@ async def manual_register(
 
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
+    if not cleanText:
+      # バーコードの無い商品には独自コードを発行する
+      cleanText = generate_internal_code(cursor)
     cursor.execute("SELECT title, price FROM items WHERE jan = ?", (cleanText,))
     existing = cursor.fetchone()
 
@@ -868,6 +947,17 @@ def get_scanner_page():
             .btn-manual { background: #3498db; color: #fff; border: none; padding: 8px 14px; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 13px; white-space: nowrap; }
             .btn-manual:hover { background: #2980b9; }
 
+            .search-box { max-width: 380px; margin: -8px auto 15px auto; background: #1e1e1e; padding: 10px; border-radius: 8px; border: 1px solid #444; box-sizing: border-box; text-align: left; }
+            .search-box .manual-input { width: 100%; box-sizing: border-box; }
+            #search-results { max-height: 320px; overflow-y: auto; }
+            .search-row { display: flex; align-items: center; gap: 8px; padding: 8px 4px; border-bottom: 1px solid #2c2c2c; cursor: pointer; font-size: 12px; }
+            .search-row:hover, .search-row:active { background: #2a2a2a; }
+            .search-row .item-info { flex-grow: 1; overflow: hidden; }
+            .search-add { background: #28a745; color: #fff; border-radius: 4px; padding: 4px 8px; font-size: 11px; font-weight: bold; flex-shrink: 0; }
+            .search-hint { color: #888; font-size: 11px; padding: 6px 2px; }
+            .btn-nobarcode { background: transparent; color: #f39c12; border: 1px dashed #f39c12; padding: 8px; border-radius: 6px; font-size: 12px; width: 100%; margin-top: 8px; cursor: pointer; font-weight: bold; }
+            .badge-internal { display: inline-block; font-size: 9px; background: #8e44ad; color: #fff; border-radius: 3px; padding: 0 4px; margin-left: 4px; vertical-align: middle; }
+
             .result-banner { background: #1e3a20; color: #d4edda; border: 1px solid #28a745; max-width: 380px; margin: 10px auto; padding: 10px; border-radius: 8px; text-align: left; display: none; font-size: 13px; }
             .banner-content { display: flex; align-items: center; justify-content: space-between; }
             .banner-item { display: flex; align-items: center; overflow: hidden; }
@@ -951,6 +1041,11 @@ def get_scanner_page():
             <button class="btn-manual" onclick="submitManualCode()">追加</button>
         </div>
 
+        <div class="search-box">
+            <input type="text" id="search-input" class="manual-input" placeholder="🔍 バーコードが無い時は商品名で検索（例: ゾロ 一番くじ）" oninput="onSearchInput()" onkeydown="if(event.key==='Enter') runSearch()">
+            <div id="search-results"></div>
+        </div>
+
         <div id="result-banner" class="result-banner">
             <div class="banner-content">
                 <div class="banner-item">
@@ -1007,7 +1102,7 @@ def get_scanner_page():
                 <button class="btn btn-google" style="margin-top:0; margin-bottom:8px;" onclick="openGoogleSearch()">🔍 GoogleでこのJANを調べる</button>
 
                 <label>JANコード</label>
-                <input type="text" id="modal-jan" readonly style="background: #222; color: #888;">
+                <input type="text" id="modal-jan" readonly style="background: #222; color: #888;" placeholder="空欄なら独自コードを自動発行">
                 <label>商品名</label>
                 <input type="text" id="modal-title" placeholder="例: フィギュア名など">
                 
@@ -1197,11 +1292,7 @@ def get_scanner_page():
                     }
 
                     const data = await res.json();
-                    if (currentMode === "stock") {
-                        await addToStock(data);
-                    } else {
-                        addOrUpdateCartItem(data);
-                    }
+                    await addItemData(data);
                     document.getElementById("error-msg").innerText = "";
 
                     if (navigator.vibrate) navigator.vibrate(50);
@@ -1282,6 +1373,7 @@ def get_scanner_page():
             }
 
             window.openManualModal = function(jan, existingTitle = "", existingImage = "") {
+                setModalJanEditable(false);
                 document.getElementById("modal-jan").value = jan;
                 document.getElementById("modal-title").value = existingTitle;
                 document.getElementById("modal-image").value = existingImage;
@@ -1309,13 +1401,15 @@ def get_scanner_page():
             }
 
             window.openGoogleSearch = function() {
-                const jan = document.getElementById("modal-jan").value;
-                const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(jan)}`;
+                const jan = document.getElementById("modal-jan").value.trim();
+                const q = jan || document.getElementById("modal-title").value.trim();
+                if (!q) return alert("JANコードか商品名を入力してください。");
+                const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(q)}`;
                 window.open(searchUrl, '_blank');
             }
 
             window.submitManualItem = async function() {
-                const jan = document.getElementById("modal-jan").value;
+                const jan = document.getElementById("modal-jan").value.trim();
                 const title = document.getElementById("modal-title").value.trim();
                 const imageUrl = document.getElementById("modal-image").value.trim();
                 const fileInput = document.getElementById("modal-file");
@@ -1387,7 +1481,11 @@ def get_scanner_page():
                 }
 
                 let jansToProcess = [];
-                keys.forEach(code => {
+                const skipped = keys.filter(isInternalCode);
+                if (skipped.length > 0) {
+                    alert(`独自コード（バーコード無し）の商品 ${skipped.length} 種はらしんばんで検索できないため除外します。`);
+                }
+                keys.filter(code => !isInternalCode(code)).forEach(code => {
                     const count = cart[code].count || 1;
                     for (let i = 0; i < count; i++) {
                         jansToProcess.push(code);
@@ -1789,6 +1887,101 @@ def get_scanner_page():
                 a.click();
                 document.body.removeChild(a);
                 URL.revokeObjectURL(a.href);
+            }
+
+            // ==========================================
+            // 商品名検索（バーコードの無い商品向け）
+            // ==========================================
+
+            let searchTimer = null;
+            let searchSeq = 0;
+            let searchResults = [];
+
+            function isInternalCode(code) {
+                return /^20\d{11}$/.test(code);
+            }
+
+            async function addItemData(data) {
+                if (currentMode === "stock") {
+                    await addToStock(data);
+                } else {
+                    addOrUpdateCartItem(data);
+                }
+            }
+
+            window.onSearchInput = function() {
+                clearTimeout(searchTimer);
+                searchTimer = setTimeout(runSearch, 300);
+            }
+
+            window.runSearch = async function() {
+                clearTimeout(searchTimer);
+                const q = document.getElementById("search-input").value.trim();
+                const container = document.getElementById("search-results");
+                if (!q) {
+                    searchSeq++;
+                    container.innerHTML = "";
+                    return;
+                }
+                const seq = ++searchSeq;
+                try {
+                    const res = await fetch(`/api/search_items?q=${encodeURIComponent(q)}`);
+                    if (!res.ok) throw new Error("HTTP " + res.status);
+                    const data = await res.json();
+                    if (seq !== searchSeq) return; // 古い検索結果は捨てる
+                    searchResults = data.items || [];
+                    renderSearchResults(q);
+                } catch (e) {
+                    if (seq === searchSeq) container.innerHTML = `<div class="search-hint" style="color:#ff6b6b;">検索に失敗しました: ${escapeHtml(e.message)}</div>`;
+                }
+            }
+
+            function renderSearchResults(q) {
+                const container = document.getElementById("search-results");
+                const target = currentMode === "stock" ? "保管在庫" : "持込リスト";
+                let html = searchResults.length === 0
+                    ? `<div class="search-hint">「${escapeHtml(q)}」に一致する登録済み商品はありません。</div>`
+                    : `<div class="search-hint">${searchResults.length}件${searchResults.length >= 30 ? "以上（キーワードを追加して絞り込めます）" : ""} ・ タップで${target}に追加</div>` +
+                      searchResults.map((item, idx) => `
+                        <div class="search-row" data-idx="${idx}">
+                            <img src="/proxy_image?jan=${encodeURIComponent(item.jan)}&url=${encodeURIComponent(item.image_url || '')}" class="item-thumb" loading="lazy" onerror="this.style.background='#442222';">
+                            <div class="item-info">
+                                <div class="item-title">${escapeHtml(item.title)}</div>
+                                <div class="item-jan">コード: ${escapeHtml(item.jan)}${item.internal ? '<span class="badge-internal">独自</span>' : ''}</div>
+                            </div>
+                            <span class="search-add">＋追加</span>
+                        </div>`).join("");
+                html += `<button class="btn-nobarcode" onclick="openNoBarcodeModal()">🏷️ 見つからない → バーコード無し商品として新規登録</button>`;
+                container.innerHTML = html;
+            }
+
+            document.getElementById("search-results").addEventListener("click", async (ev) => {
+                const row = ev.target.closest(".search-row");
+                if (!row) return;
+                const item = searchResults[parseInt(row.dataset.idx)];
+                if (!item) return;
+                try {
+                    await addItemData(item);
+                    document.getElementById("error-msg").innerText = "";
+                    if (navigator.vibrate) navigator.vibrate(50);
+                } catch (e) {
+                    document.getElementById("error-msg").innerText = "追加に失敗しました: " + e.message;
+                }
+            });
+
+            function setModalJanEditable(editable) {
+                const el = document.getElementById("modal-jan");
+                el.readOnly = !editable;
+                el.style.background = editable ? "#333" : "#222";
+                el.style.color = editable ? "#fff" : "#888";
+            }
+
+            window.openNoBarcodeModal = function() {
+                openManualModal("", "", "");
+                setModalJanEditable(true);
+                document.getElementById("modal-title").value = document.getElementById("search-input").value.trim();
+                document.getElementById("modal-heading").innerText = "🏷️ バーコード無し商品の登録";
+                document.getElementById("modal-desc").innerText = "JANコードは空欄のままでOKです。独自コード（20から始まる13桁）を自動で発行して登録します。次回からは商品名検索で呼び出せます。";
             }
         </script>
     </body>
