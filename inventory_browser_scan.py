@@ -236,6 +236,8 @@ if _trader_storage not in ("google_sheets", "local"):
   raise RuntimeError("TRADER_STORAGE must be google_sheets or local")
 if _trader_storage == "google_sheets":
   from trader_sheets import SheetEventStore
+  from lashinbang_link_store import LinkSheetStore
+  lashinbang_quotes.link_store = LinkSheetStore(get_spreadsheet)
   trader_service.sheet_store = SheetEventStore(
       get_spreadsheet, trader_service.data_dir,
       os.environ.get("TRADER_SHEET_NAME", "トレーダー記録"))
@@ -579,7 +581,11 @@ def get_stock():
   except Exception:
     quotes = {s["jan"]: {"status": "unavailable", "price_yen": None} for s in items}
   version = lashinbang_quotes.version
-  lashinbang = lashinbang_quotes.get_many(s["jan"] for s in items)
+  try:
+    lashinbang = lashinbang_quotes.get_many(s["jan"] for s in items)
+  except Exception:
+    traceback.print_exc()
+    lashinbang = {s["jan"]: {"status": "error", "price_yen": None, "error_message": "紐づけの保存先を確認してください"} for s in items}
   for item in items:
     item["trader_quote"] = quotes.get(item["jan"])
     item["lashinbang_quote"] = lashinbang.get(item["jan"])
@@ -592,13 +598,64 @@ class LashinbangRefreshRequest(BaseModel):
 
 @app.post("/api/lashinbang/refresh")
 def refresh_lashinbang(data: LashinbangRefreshRequest):
-  if not supported_jan(data.jan):
-    raise HTTPException(400, "市販商品の13桁JANコードが必要です")
+  if not supported_jan(data.jan) and not lashinbang_quotes.link(data.jan):
+    raise HTTPException(400, "商品名検索で紐づけてから更新してください")
   with sqlite3.connect(db_path) as conn:
     if not conn.execute("SELECT 1 FROM stock WHERE jan=? AND count>0", (data.jan,)).fetchone():
       raise HTTPException(404, "保管在庫に商品がありません")
   lashinbang_quotes.schedule(data.jan, force=True)
   return {"status": "pending"}
+
+
+class LashinbangSearchRequest(BaseModel):
+  jan: str
+  query: str = ""
+
+
+class LashinbangSelectRequest(BaseModel):
+  jan: str
+  token: str
+  master_id: str
+
+
+def validate_lashinbang_item(jan):
+  if not re.fullmatch(r"[0-9]{13}", jan):
+    raise HTTPException(400, "在庫コードが不正です")
+  with sqlite3.connect(db_path) as conn:
+    if not conn.execute("SELECT 1 FROM stock WHERE jan=? AND count>0", (jan,)).fetchone():
+      raise HTTPException(404, "保管在庫に商品がありません")
+
+
+@app.post("/api/lashinbang/search")
+def search_lashinbang(data: LashinbangSearchRequest):
+  validate_lashinbang_item(data.jan)
+  if len(data.query) > 100:
+    raise HTTPException(400, "検索語は100文字以内にしてください")
+  try:
+    return lashinbang_quotes.name_candidates(data.jan, data.query)
+  except ValueError as exc:
+    raise HTTPException(400, str(exc)) from exc
+  except Exception as exc:
+    traceback.print_exc()
+    raise HTTPException(503, "らしんばんの検索に失敗しました。少し待って再検索してください") from exc
+
+
+@app.post("/api/lashinbang/select")
+def select_lashinbang(data: LashinbangSelectRequest):
+  validate_lashinbang_item(data.jan)
+  try:
+    return lashinbang_quotes.select(data.jan, data.token, data.master_id)
+  except ValueError as exc:
+    raise HTTPException(400, str(exc)) from exc
+  except Exception as exc:
+    traceback.print_exc()
+    raise HTTPException(503, "紐づけの保存完了を確認できませんでした。保存先を確認して再実行してください") from exc
+
+
+@app.get("/lashinbang-ui.js")
+def lashinbang_ui_script():
+  from fastapi.responses import FileResponse
+  return FileResponse(os.path.join(base_dir, "lashinbang-ui.js"), media_type="application/javascript", headers={"Cache-Control": "no-cache"})
 
 
 @app.post("/api/stock/adjust")
@@ -2267,7 +2324,7 @@ def get_scanner_page():
                     return `<div class="stock-price">${prefix} ${range}<br><small>同じJANに${quote.candidates.length}商品・候補を確認${checking}${quote.refresh_error ? " ・ 更新失敗（前回値）" : ""}</small><br><small>${escapeHtml(checked)}${quote.stale ? " ・ 更新推奨" : ""}</small></div>`;
                 }
                 if (quote.status !== "ok") {
-                    const labels = {unlinked:"未紐づけ", unavailable:"取得できませんでした", needs_review:"要確認", pending:"取得中", not_found:"買取掲載なし", unsupported:"独自コード対象外", error:"取得失敗"};
+                    const labels = {unlinked:"未紐づけ", unavailable:"取得できませんでした", needs_review:"要確認", pending:"取得中", not_found:"買取掲載なし", unsupported:"商品名で検索してください", error:"取得失敗"};
                     return `<div class="stock-price"><small>${prefix}：${labels[quote.status] || "要確認"}${checking}${quote.error_message ? `（${escapeHtml(quote.error_message)}）` : ""}</small></div>`;
                 }
                 return `<div class="stock-price">${prefix} ¥${Number(quote.price_yen).toLocaleString("ja-JP")} <small>／個</small><br><small>${escapeHtml(checked)}${quote.stale ? " ・ 更新推奨" : ""}${checking}${quote.refresh_error ? " ・ 更新失敗（前回値）" : ""}</small></div>`;
@@ -2312,7 +2369,11 @@ def get_scanner_page():
                                 <div class="item-jan">コード: ${escapeHtml(item.jan)}</div>
                                 ${stockPriceHtml(item.trader_quote)}
                                 ${stockPriceHtml(item.lashinbang_quote, "らしんばん")}
-                                ${!isInternalCode(item.jan) ? `<div class="lashinbang-actions"><a href="https://shop.lashinbang.com/kaitori/list?jan=${encodeURIComponent(item.jan)}" target="_blank" rel="noopener noreferrer">なっとく買取</a> <button type="button" data-act="lashinbang" ${attrs} ${item.lashinbang_quote?.pending ? "disabled" : ""}>更新</button></div>` : ""}
+                                <div class="lashinbang-actions">
+                                    <button type="button" data-act="lashinbang-search" ${attrs}>${item.lashinbang_quote?.linked ? "紐づけ変更" : "商品名で検索"}</button>
+                                    ${(!isInternalCode(item.jan) || item.lashinbang_quote?.linked) ? `<button type="button" data-act="lashinbang" ${attrs} ${item.lashinbang_quote?.pending ? "disabled" : ""}>更新</button>` : ""}
+                                    ${!isInternalCode(item.jan) ? `<a href="https://shop.lashinbang.com/kaitori/list?jan=${encodeURIComponent(item.jan)}" target="_blank" rel="noopener noreferrer">なっとく買取</a>` : ""}
+                                </div>
                                 ${loc}
                             </div>
                             <div class="qty-control">
@@ -2344,6 +2405,11 @@ def get_scanner_page():
                     }
                     case "trader": openTraderForJan(jan); break;
                     case "lashinbang": refreshLashinbang(jan); break;
+                    case "lashinbang-search": {
+                        const item = findStock(jan, location);
+                        if (item) openLashinbangForJan(jan, item.title);
+                        break;
+                    }
                     case "mercari": {
                         const item = findStock(jan, location);
                         if (item) openMercariModal(item.title);
@@ -2655,6 +2721,7 @@ def get_scanner_page():
                 navigator.clipboard.writeText(getShareUrl()).then(() => alert("URLをコピーしました！"));
             }
         </script>
+        <script src="/lashinbang-ui.js"></script>
         <script src="/trader-ui.js"></script>
     </body>
     </html>

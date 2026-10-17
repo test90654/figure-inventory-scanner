@@ -101,6 +101,7 @@
         if(job.status==='done') {
           if(job.linked && window.loadStock) window.loadStock();
           results.replaceChildren();
+          if(job.query) el('small','検索語: '+job.query,results);
           if(!job.products.length) el('div','候補がありません。検索語を短くして再検索してください。',results);
           else if(!job.linked) el('div','同じ商品か、キャラクター・衣装・PLUS等の版・型番を確認して選んでください。',results);
           const INITIAL=3;

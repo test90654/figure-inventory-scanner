@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from PIL import Image
 from price_ocr import normalize, read_price
 from trader_search import Client, URL, form_payload, parse_results, parse_detail
+from search_terms import search_query, shorter_query
 
 TTL=6*60*60
 
@@ -24,9 +25,7 @@ def now():
     return dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).isoformat(timespec='seconds')
 
 def suggest_query(title):
-    title=re.sub(r'[【\[].*?[】\]]',' ',title)
-    title=re.sub(r'[「」『』“”"～~（）()・]', ' ', title)
-    return re.sub(r'\s+', ' ', title).strip()[:100]
+    return search_query(title)
 
 class StartRequest(BaseModel):
     jan: str = Field(min_length=1,max_length=32,pattern=r'^\d+$')
@@ -193,7 +192,7 @@ class TraderService:
 
     def start(self,request):
         state=self.state(request.jan)
-        query=(request.query or state['suggested_query']).strip()
+        query=search_query(request.query or state['suggested_query'])
         if not query: raise HTTPException(400,'検索語を入力してください')
         linked=state['link'] if not request.search and not request.query else None
         if linked and linked['title_changed']: linked=None
@@ -288,7 +287,12 @@ class TraderService:
                 self.accept_quote(request.jan,linked,current,product,request.refresh)
                 products=[current]
             else:
-                products=self.search(client,self.job(token)['query'],token,request.refresh)
+                query=self.job(token)['query']
+                products=self.search(client,query,token,request.refresh)
+                shorter=shorter_query(query)
+                if not products and shorter != query:
+                    self.update(token,query=shorter,progress='候補がないため検索語を短くして再検索中')
+                    products=self.search(client,shorter,token,request.refresh)
             self.update(token,status='done',progress='完了',products=products,linked=bool(linked))
         except Exception as exc:
             self.update(token,status='error',progress='取得できませんでした',error=exc.detail if isinstance(exc,HTTPException) else str(exc))
