@@ -6,69 +6,65 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from lashinbang_quotes import LashinbangQuotes, search_paths, lookup_quote, parse_detail, supported_jan
+from lashinbang_quotes import LashinbangQuotes, search_quotes, lookup_quote, supported_jan
 
 JAN = "4580886930067"
 PATH = "/kaitori/detail/8695570"
-# Minimal form of the official buyback DOM verified on 2026-10-17.
-DETAIL = '''<div id="item_data"><h1>Figure</h1>
-<div class="kaitori_price_box"><p class="price red">1,200<span>円</span></p></div>
-<table><tr><th>JANコード</th><td>4580886930067</td></tr></table></div>'''
 def search_body(items):
     return 'callback(' + json.dumps({'kotohaco': {'result': {'info': {'status': 0, 'hitnum': len(items)}, 'items': items}}}) + ')'
 
-ITEM = {'itemid': '8695570', 'keyword2': JAN, 'number10': 1, 'price': 1690}
+ITEM = {'itemid': '8695570', 'keyword2': JAN, 'number10': 1, 'price': 1690, 'number5': 500, 'number19': 600, 'title': 'Figure'}
 LIST = search_body([ITEM])
 
 
 class ParsingTests(unittest.TestCase):
-    def test_exact_jan_and_buyback_price(self):
-        quote = parse_detail(DETAIL, JAN, PATH)
-        self.assertEqual(quote["price_yen"], 1200)
-        self.assertEqual(quote["source_url"], "https://shop.lashinbang.com" + PATH)
-        self.assertIsNone(parse_detail(DETAIL, "4580886930074", PATH))
-
-    def test_zero_missing_and_ambiguous_price(self):
-        self.assertEqual(parse_detail(DETAIL.replace("1,200", "0"), JAN, PATH)["price_yen"], 0)
-        for value in ("要確認", "1,200～2,000", "1,200円 / 2,000"):
-            self.assertEqual(parse_detail(DETAIL.replace("1,200", value), JAN, PATH)["status"], "needs_review")
-
-    def test_wrong_page_and_absent_jan_are_not_prices(self):
-        with self.assertRaises(ValueError):
-            parse_detail('<h1>ログイン</h1>', JAN, PATH)
-        self.assertIsNone(parse_detail(DETAIL.replace("JANコード", "商品番号"), JAN, PATH))
+    def test_uses_buyback_fields_and_never_retail_price(self):
+        quote = search_quotes(LIST, JAN)[0]
+        self.assertEqual(quote['price_yen'], 600)
+        self.assertEqual(quote['source_url'], 'https://shop.lashinbang.com' + PATH)
+        self.assertEqual(search_quotes(search_body([{**ITEM, 'number19': None}]), JAN)[0]['price_yen'], 500)
 
     def test_search_is_scoped_to_buyback_and_exact_jan(self):
-        self.assertEqual(search_paths(LIST, JAN), [PATH])
-        self.assertEqual(search_paths(search_body([]), JAN), [])
-        self.assertEqual(search_paths(search_body([{**ITEM, 'number10': 0}]), JAN), [])
-        self.assertEqual(search_paths(search_body([{**ITEM, 'keyword2': '4580886930074'}]), JAN), [])
+        self.assertEqual(search_quotes(search_body([]), JAN), [])
+        self.assertEqual(search_quotes(search_body([{**ITEM, 'number10': 0}]), JAN), [])
+        self.assertEqual(search_quotes(search_body([{**ITEM, 'keyword2': '4580886930074'}]), JAN), [])
         with self.assertRaises(ValueError):
-            search_paths('<h1>アクセスできません</h1>', JAN)
+            search_quotes('<h1>アクセスできません</h1>', JAN)
         with self.assertRaises(ValueError):
-            search_paths(search_body([{**ITEM, 'itemid': '../123'}]), JAN)
+            search_quotes(search_body([{**ITEM, 'itemid': '../123'}]), JAN)
 
-    def test_lookup_verifies_detail_instead_of_search_position(self):
-        session = Mock()
-        def response(html):
-            result = Mock(text=html, url=("https://lashinbang-f-s.snva.jp/" if html.startswith("callback(") else "https://shop.lashinbang.com" + PATH))
-            return result
-        session.get.side_effect = [response(LIST), response(DETAIL)]
-        self.assertEqual(lookup_quote(JAN, session)["price_yen"], 1200)
-        self.assertEqual(session.get.call_count, 2)
+    def test_missing_or_invalid_buyback_fields_do_not_use_sale_price(self):
+        for value in (None, '500', True, -1):
+            quote = search_quotes(search_body([{**ITEM, 'number5': value, 'number19': None}]), JAN)[0]
+            self.assertEqual(quote['status'], 'needs_review')
+            self.assertIsNone(quote['price_yen'])
+        self.assertEqual(search_quotes(search_body([{**ITEM, 'number5': 0, 'number19': None}]), JAN)[0]['price_yen'], 0)
 
-    def test_multiple_exact_matches_require_review(self):
+    def test_lookup_never_requests_detail_page_that_can_return_403(self):
         session = Mock()
-        def response(html):
-            return Mock(text=html, url=("https://lashinbang-f-s.snva.jp/" if html.startswith("callback(") else "https://shop.lashinbang.com" + PATH))
-        session.get.side_effect = [response(search_body([ITEM, {**ITEM, 'itemid':'8695571'}])), response(DETAIL), response(DETAIL)]
-        self.assertEqual(lookup_quote(JAN, session)["status"], "needs_review")
+        response = Mock(text=LIST, url='https://lashinbang-f-s.snva.jp/')
+        session.get.side_effect = [response, AssertionError('Detail request must not occur')]
+        self.assertEqual(lookup_quote(JAN, session)['price_yen'], 600)
+        session.get.assert_called_once()
+        self.assertEqual(session.get.call_args.args[0], 'https://lashinbang-f-s.snva.jp/')
+        self.assertEqual(session.get.call_args.kwargs['params']['controller'], 'lashinbang_kaitori')
+
+    def test_multiple_exact_matches_return_range_without_selecting_item(self):
+        session = Mock()
+        body = search_body([{**ITEM, 'number19': 500}, {**ITEM, 'itemid':'7892986', 'number19': 600}])
+        session.get.return_value = Mock(text=body, url='https://lashinbang-f-s.snva.jp/')
+        quote = lookup_quote(JAN, session)
+        self.assertEqual(quote['status'], 'multiple')
+        self.assertEqual((quote['price_min'], quote['price_max']), (500, 600))
+        self.assertIsNone(quote['price_yen'])
+        self.assertEqual(len(quote['candidates']), 2)
+        session.get.assert_called_once()
 
     def test_internal_codes_never_search(self):
         session = Mock()
-        self.assertFalse(supported_jan("2000000000015"))
-        self.assertFalse(supported_jan("../123"))
-        self.assertEqual(lookup_quote("2000000000015", session)["status"], "unsupported")
+        self.assertFalse(supported_jan('2000000000015'))
+        self.assertFalse(supported_jan('../123'))
+        self.assertEqual(lookup_quote('2000000000015', session)['status'], 'unsupported')
         session.get.assert_not_called()
 
 
