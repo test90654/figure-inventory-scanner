@@ -2,6 +2,7 @@ import datetime
 import io
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -229,6 +230,65 @@ if _trader_storage == "google_sheets":
   trader_service.sheet_store = SheetEventStore(
       get_spreadsheet, trader_service.data_dir,
       os.environ.get("TRADER_SHEET_NAME", "トレーダー記録"))
+
+
+# らしんばんオンライン（販売側）の商品検索。JSONPで返り、keyword2 にJANが入っている
+LASHINBANG_SEARCH_URL = "https://lashinbang-f-s.snva.jp/"
+LASHINBANG_MISS_TTL = 6 * 3600
+lashinbang_miss_cache = {}
+
+
+def lookup_lashinbang_by_jan(jan: str):
+  """DBに無いJANをらしんばんオンラインの販売ページから引く。見つからなければ None"""
+  missed_at = lashinbang_miss_cache.get(jan)
+  if missed_at and time.time() - missed_at < LASHINBANG_MISS_TTL:
+    return None
+  try:
+    params = {
+        "q": jan,
+        "searchbox": "1",
+        "pl": "1",
+        "sort": "Score,Number7",
+        "limit": "10",
+        "o": "0",
+        "controller": "lashinbang_front",
+        "callback": "callback",
+    }
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        ),
+        "Referer": "https://shop.lashinbang.com/",
+    }
+    res = requests.get(
+        LASHINBANG_SEARCH_URL, params=params, headers=headers, timeout=5.0
+    )
+    if res.status_code != 200:
+      return None
+
+    body = res.text.strip()
+    body = body[body.index("(") + 1 : body.rindex(")")]
+    items = json.loads(body)["kotohaco"]["result"]["items"]
+
+    # 全文検索なので部分一致も混ざる。JANが完全一致する商品だけを採用する
+    for item in items:
+      if (item.get("keyword2") or "").strip() != jan:
+        continue
+      # 「【未開封】」などの状態表記を商品名から外す
+      title = re.sub(r"^(【[^】]*】\s*)+", "", item.get("title") or "").strip()
+      if not title:
+        continue
+      return {
+          "title": title,
+          "image_url": item.get("image") or "",
+          "source_url": item.get("url") or "",
+      }
+
+    lashinbang_miss_cache[jan] = time.time()
+    return None
+  except Exception as e:
+    print(f"⚠️ らしんばんJAN検索スキップ (JAN: {jan}): {e}")
+    return None
 
 
 def search_neatz_fallback(query_code: str):
@@ -1388,7 +1448,9 @@ def get_scanner_page():
 
                     const data = await res.json();
                     await addItemData(data);
-                    document.getElementById("error-msg").innerText = "";
+                    document.getElementById("error-msg").innerText = data.source === "lashinbang"
+                        ? "🔎 らしんばんオンラインから商品情報を取得して登録しました"
+                        : "";
 
                     if (navigator.vibrate) navigator.vibrate(50);
                 } catch (e) {
@@ -2157,8 +2219,16 @@ def get_scanner_page():
   return html_content
 
 
+def append_item_to_sheet(jan: str, title: str, image_url: str, price: str):
+  try:
+    main_sheet, _ = get_gspread_sheets()
+    main_sheet.append_row([jan, title, image_url, price])
+  except Exception as e:
+    print(f"⚠️ スプレッドシートへの商品追加スキップ (JAN: {jan}): {e}")
+
+
 @app.post("/process_jan")
-def process_jan_code(data: ScanRequest):
+def process_jan_code(data: ScanRequest, background_tasks: BackgroundTasks):
   try:
     raw_code = data.jan
     cleanText = "".join(filter(str.isdigit, raw_code))
@@ -2186,6 +2256,49 @@ def process_jan_code(data: ScanRequest):
     )
     row = cursor.fetchone()
     conn.close()
+
+    # DBに無い市販JANは、らしんばんオンラインの販売ページから商品情報を引いて登録する
+    if not row and not cleanText.startswith(INTERNAL_CODE_PREFIX):
+      found = lookup_lashinbang_by_jan(cleanText)
+      if found:
+        price = "買取中!!"
+        meta = resolve_quote_meta(found["title"])
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+                INSERT OR REPLACE INTO items (jan, title, image_url, price, maker, quote_label, source_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cleanText,
+                found["title"],
+                found["image_url"],
+                price,
+                meta["maker"],
+                meta["quote_label"],
+                meta["source_url"],
+            ),
+        )
+        conn.commit()
+        conn.close()
+        background_tasks.add_task(
+            append_item_to_sheet,
+            cleanText,
+            found["title"],
+            found["image_url"],
+            price,
+        )
+        return {
+            "source": "lashinbang",
+            "jan": cleanText,
+            "title": found["title"],
+            "image_url": found["image_url"],
+            "price": price,
+            "quote_label": meta["quote_label"],
+            "source_url": meta["source_url"],
+            "lashinbang_url": found["source_url"],
+        }
 
     if not row:
       try:
