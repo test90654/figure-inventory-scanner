@@ -10,6 +10,12 @@ def search_query(value):
     return re.sub(r'\s+', ' ', value).strip()[:100]
 
 
+def trader_query(value):
+    # U+30FC is a letter, so Unicode punctuation normalization does not cover it.
+    value = unicodedata.normalize('NFKC', value or '').replace('ー', ' ')
+    return search_query(value)
+
+
 def shorter_query(value):
     value = search_query(value)
     shorter = re.sub(r'(?i)\b(?:BANDAI SPIRITS|BANPRESTO|FIGURE)\b', ' ', value)
