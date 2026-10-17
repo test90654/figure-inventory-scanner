@@ -23,6 +23,7 @@ from playwright.sync_api import sync_playwright
 from mercari_search import build_url as build_mercari_url
 from mercari_search import price_summary, search_mercari
 from trader_integration import TraderService, build_router
+from lashinbang_quotes import LashinbangQuotes, supported_jan
 
 app = FastAPI(title="Figure Inventory Cloud Edition")
 
@@ -183,6 +184,8 @@ def init_db():
 
 
 init_db()
+
+lashinbang_quotes = LashinbangQuotes(db_path)
 
 trader_service = TraderService(db_path, os.environ.get("TRADER_DATA_DIR", os.path.join(base_dir, "trader_data")))
 app.include_router(build_router(trader_service))
@@ -575,9 +578,27 @@ def get_stock():
     quotes = trader_service.stock_quotes(s["jan"] for s in items) if items else {}
   except Exception:
     quotes = {s["jan"]: {"status": "unavailable", "price_yen": None} for s in items}
+  version = lashinbang_quotes.version
+  lashinbang = lashinbang_quotes.get_many(s["jan"] for s in items)
   for item in items:
     item["trader_quote"] = quotes.get(item["jan"])
-  return {"items": items}
+    item["lashinbang_quote"] = lashinbang.get(item["jan"])
+  return {"items": items, "lashinbang_version": version}
+
+
+class LashinbangRefreshRequest(BaseModel):
+  jan: str
+
+
+@app.post("/api/lashinbang/refresh")
+def refresh_lashinbang(data: LashinbangRefreshRequest):
+  if not supported_jan(data.jan):
+    raise HTTPException(400, "市販商品の13桁JANコードが必要です")
+  with sqlite3.connect(db_path) as conn:
+    if not conn.execute("SELECT 1 FROM stock WHERE jan=? AND count>0", (data.jan,)).fetchone():
+      raise HTTPException(404, "保管在庫に商品がありません")
+  lashinbang_quotes.schedule(data.jan, force=True)
+  return {"status": "pending"}
 
 
 @app.post("/api/stock/adjust")
@@ -769,6 +790,7 @@ def sync_state(box: str = "default"):
       "cart_version": row[0] if row else 0,
       "stock_version": _stock_sync_gen,
       "trader_version": trader_service.quote_version(),
+      "lashinbang_version": lashinbang_quotes.version,
   }
 
 
@@ -1250,8 +1272,12 @@ def get_scanner_page():
             
             #stock-items .item-info { min-width: 0; overflow-wrap: anywhere; }
             .stock-price { color: #ffcf79; font-size: 13px; margin-top: 4px; font-weight: bold; }
+            .lashinbang-actions { font-size: 10px; margin-top: 3px; }
+            .lashinbang-actions a { color: #9fd0ff; }
+            .lashinbang-actions button { background: #333; color: #eee; border: 1px solid #777; border-radius: 3px; font-size: 10px; cursor: pointer; }
+            .lashinbang-actions button:disabled { opacity: .5; cursor: wait; }
             .stock-price small { color: #aaa; font-size: 10px; font-weight: normal; }
-            @media (max-width: 599px) {
+            @media (max-width: 899px) {
                 #stock-items .item-row { display: grid; grid-template-columns: 36px minmax(0, 1fr); align-items: start; }
                 #stock-items .qty-control { grid-column: 2; flex-wrap: wrap; white-space: normal; }
             }
@@ -2119,6 +2145,7 @@ def get_scanner_page():
                     if (!res.ok) throw new Error("HTTP " + res.status);
                     const data = await res.json();
                     stockItems = data.items || [];
+                    lashinbangVersion = data.lashinbang_version;
                     renderStock();
                 } catch (e) {
                     document.getElementById("stock-items").innerHTML = `<p style="color:#ff6b6b; text-align:center;">在庫の読み込みに失敗しました: ${escapeHtml(e.message)}</p>`;
@@ -2156,6 +2183,7 @@ def get_scanner_page():
                 }
                 renderStock();
                 showStockBanner(info);
+                await loadStock();
             }
 
             function showStockBanner(item) {
@@ -2228,14 +2256,27 @@ def get_scanner_page():
                 );
             }
 
-            function stockPriceHtml(quote) {
-                if (!quote) return '<div class="stock-price"><small>買取参考：未取得</small></div>';
+            function stockPriceHtml(quote, label = "トレーダー") {
+                const prefix = escapeHtml(label);
+                if (!quote) return `<div class="stock-price"><small>${prefix}：未取得</small></div>`;
+                const checking = quote.pending ? " ・ 更新中" : "";
                 if (quote.status !== "ok") {
-                    const label = quote.status === "unlinked" ? "未紐づけ" : quote.status === "unavailable" ? "取得できませんでした" : "要確認";
-                    return `<div class="stock-price"><small>買取参考：${label}</small></div>`;
+                    const labels = {unlinked:"未紐づけ", unavailable:"取得できませんでした", needs_review:"要確認", pending:"取得中", not_found:"買取掲載なし", unsupported:"独自コード対象外", error:"取得失敗"};
+                    return `<div class="stock-price"><small>${prefix}：${labels[quote.status] || "要確認"}${checking}</small></div>`;
                 }
                 const checked = quote.checked_at ? `確認 ${quote.checked_at.replace("T", " ").slice(0, 16)}` : "";
-                return `<div class="stock-price">買取参考 ¥${Number(quote.price_yen).toLocaleString("ja-JP")} <small>／個</small><br><small>${escapeHtml(checked)}${quote.stale ? " ・ 更新推奨" : ""}</small></div>`;
+                return `<div class="stock-price">${prefix} ¥${Number(quote.price_yen).toLocaleString("ja-JP")} <small>／個</small><br><small>${escapeHtml(checked)}${quote.stale ? " ・ 更新推奨" : ""}${checking}${quote.refresh_error ? " ・ 更新失敗（前回値）" : ""}</small></div>`;
+            }
+
+            window.refreshLashinbang = async function(jan) {
+                try {
+                    const res = await fetch('/api/lashinbang/refresh', {
+                        method: 'POST', headers: {'Content-Type':'application/json'},
+                        body: JSON.stringify({jan})
+                    });
+                    if (!res.ok) throw new Error("価格更新を開始できませんでした");
+                    await loadStock();
+                } catch (e) { alert(e.message); }
             }
 
             window.renderStock = function() {
@@ -2265,6 +2306,8 @@ def get_scanner_page():
                                 <div class="item-title">${escapeHtml(item.title)}</div>
                                 <div class="item-jan">コード: ${escapeHtml(item.jan)}</div>
                                 ${stockPriceHtml(item.trader_quote)}
+                                ${stockPriceHtml(item.lashinbang_quote, "らしんばん")}
+                                ${!isInternalCode(item.jan) ? `<div class="lashinbang-actions"><a href="https://shop.lashinbang.com/kaitori/list?jan=${encodeURIComponent(item.jan)}" target="_blank" rel="noopener noreferrer">なっとく買取</a> <button type="button" data-act="lashinbang" ${attrs} ${item.lashinbang_quote?.pending ? "disabled" : ""}>更新</button></div>` : ""}
                                 ${loc}
                             </div>
                             <div class="qty-control">
@@ -2295,6 +2338,7 @@ def get_scanner_page():
                         break;
                     }
                     case "trader": openTraderForJan(jan); break;
+                    case "lashinbang": refreshLashinbang(jan); break;
                     case "mercari": {
                         const item = findStock(jan, location);
                         if (item) openMercariModal(item.title);
@@ -2449,6 +2493,7 @@ def get_scanner_page():
             let serverInstance = "";
             let stockVersion = null;
             let traderVersion = null;
+            let lashinbangVersion = null;
             let pendingCartOps = 0;
             let cartOpChain = Promise.resolve();
             let cartDirty = false; // 送信に失敗した変更が端末内に残っている
@@ -2557,11 +2602,12 @@ def get_scanner_page():
                         setSyncStatus("ok", "☁ 同期済み");
                     }
 
-                    if (currentMode === "stock" && ((stockVersion !== null && st.stock_version !== stockVersion) || (traderVersion !== null && st.trader_version !== traderVersion))) {
+                    if (currentMode === "stock" && ((stockVersion !== null && st.stock_version !== stockVersion) || (traderVersion !== null && st.trader_version !== traderVersion) || (lashinbangVersion !== null && st.lashinbang_version !== lashinbangVersion))) {
                         loadStock();
                     }
                     stockVersion = st.stock_version;
                     traderVersion = st.trader_version;
+                    lashinbangVersion = st.lashinbang_version;
                 } catch (e) {
                     setSyncStatus("err", "⚠ オフライン（端末内に保存中）");
                 }
