@@ -20,6 +20,7 @@ import requests
 from playwright.sync_api import sync_playwright
 from mercari_search import build_url as build_mercari_url
 from mercari_search import price_summary, search_mercari
+from trader_integration import TraderService, build_router
 
 app = FastAPI(title="Figure Inventory Cloud Edition")
 
@@ -32,7 +33,7 @@ app.add_middleware(
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 credential_path = os.path.join(base_dir, "credentials.json")
-db_path = os.path.join(base_dir, "inventory.db")
+db_path = os.environ.get("INVENTORY_DB_PATH", os.path.join(base_dir, "inventory.db"))
 img_cache_dir = os.path.join(base_dir, "img_cache")
 os.makedirs(img_cache_dir, exist_ok=True)
 
@@ -181,6 +182,14 @@ def init_db():
 
 init_db()
 
+trader_service = TraderService(db_path, os.environ.get("TRADER_DATA_DIR", os.path.join(base_dir, "trader_data")))
+app.include_router(build_router(trader_service))
+
+@app.get("/trader-ui.js")
+def trader_ui_script():
+  from fastapi.responses import FileResponse
+  return FileResponse(os.path.join(base_dir, "trader-ui.js"), media_type="application/javascript")
+
 
 def get_spreadsheet():
   scope = [
@@ -208,6 +217,18 @@ def get_gspread_sheets():
     unreg_sheet.append_row(["JAN", "発見日時"])
 
   return main_sheet, unreg_sheet
+
+
+# Free Render: Sheets is durable; SQLite and images are disposable caches.
+# The existing spreadsheet provider is reused without changing its item/stock sheets.
+_trader_storage = os.environ.get("TRADER_STORAGE", "google_sheets").strip().lower()
+if _trader_storage not in ("google_sheets", "local"):
+  raise RuntimeError("TRADER_STORAGE must be google_sheets or local")
+if _trader_storage == "google_sheets":
+  from trader_sheets import SheetEventStore
+  trader_service.sheet_store = SheetEventStore(
+      get_spreadsheet, trader_service.data_dir,
+      os.environ.get("TRADER_SHEET_NAME", "トレーダー記録"))
 
 
 def search_neatz_fallback(query_code: str):
@@ -1720,6 +1741,7 @@ def get_scanner_page():
                             <button class="qty-btn" onclick="changeQty('${code}', 1)">+</button>
                             <button class="img-edit-btn" onclick="openEditImageModal('${code}')">画像</button>
                             <button class="mercari-btn" onclick="openMercariModal(cart['${code}'].title)">相場</button>
+                            <button class="mercari-btn" onclick="openTraderForJan('${code}')">買取</button>
                             <button class="del-btn" onclick="removeItem('${code}')">×</button>
                         </div>
                     `;
@@ -1962,6 +1984,7 @@ def get_scanner_page():
                                 <button class="qty-btn" data-act="inc" ${attrs}>+</button>
                                 <button class="img-edit-btn" data-act="img" ${attrs}>画像</button>
                                 <button class="mercari-btn" data-act="mercari" ${attrs}>相場</button>
+                                <button class="mercari-btn" data-act="trader" ${attrs}>買取</button>
                                 <button class="del-btn" data-act="del" ${attrs}>×</button>
                             </div>
                         </div>`;
@@ -1982,6 +2005,7 @@ def get_scanner_page():
                         if (item) openManualModal(jan, item.title, item.image_url || "");
                         break;
                     }
+                    case "trader": openTraderForJan(jan); break;
                     case "mercari": {
                         const item = findStock(jan, location);
                         if (item) openMercariModal(item.title);
@@ -2048,6 +2072,7 @@ def get_scanner_page():
                 } else {
                     addOrUpdateCartItem(data);
                 }
+                if (window.traderOnItem) window.traderOnItem(data);
             }
 
             window.onSearchInput = function() {
@@ -2125,6 +2150,7 @@ def get_scanner_page():
                 document.getElementById("modal-desc").innerText = "JANコードは空欄のままでOKです。独自コード（20から始まる13桁）を自動で発行して登録します。次回からは商品名検索で呼び出せます。";
             }
         </script>
+        <script src="/trader-ui.js"></script>
     </body>
     </html>
     """
