@@ -190,7 +190,12 @@ app.include_router(build_router(trader_service))
 @app.get("/trader-ui.js")
 def trader_ui_script():
   from fastapi.responses import FileResponse
-  return FileResponse(os.path.join(base_dir, "trader-ui.js"), media_type="application/javascript")
+  # 更新がすぐ反映されるよう、毎回サーバーに変更有無を確認させる（未変更なら304で軽量）
+  return FileResponse(
+      os.path.join(base_dir, "trader-ui.js"),
+      media_type="application/javascript",
+      headers={"Cache-Control": "no-cache"},
+  )
 
 
 def get_spreadsheet():
@@ -1307,7 +1312,6 @@ def get_scanner_page():
             @media (min-width: 900px) {
                 body { zoom: 1.1; padding: 16px 20px; }
                 .layout { display: grid; grid-template-columns: minmax(300px, 340px) minmax(0, 680px); justify-content: center; align-items: start; gap: 24px; }
-                .col-main { position: sticky; top: 12px; }
                 .layout #reader-container, .layout .manual-input-box, .layout .search-box, .layout .result-banner,
                 .layout .list-section, .layout .mode-tabs, .layout .location-box, .layout .btn-toggle { max-width: none; }
                 .layout .list-section { margin-top: 0; }
@@ -2576,7 +2580,12 @@ def get_scanner_page():
     </body>
     </html>
     """
-  return html_content
+  # trader-ui.js を更新した時に古いキャッシュが使われないよう、更新時刻をURLに付ける
+  ui_version = int(os.path.getmtime(os.path.join(base_dir, "trader-ui.js")))
+  return html_content.replace(
+      '<script src="/trader-ui.js"></script>',
+      f'<script src="/trader-ui.js?v={ui_version}"></script>',
+  )
 
 
 def append_item_to_sheet(jan: str, title: str, image_url: str, price: str):

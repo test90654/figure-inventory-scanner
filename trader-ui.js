@@ -27,7 +27,11 @@
   }
   function heading(state) {
     panel.replaceChildren();panel.style.display='block';
-    el('strong','トレーダー参考買取価格');
+    const head=el('div');head.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px';
+    el('strong','トレーダー参考買取価格',head);
+    const close=el('button','✕ 閉じる',head);close.type='button';
+    close.style.cssText='background:transparent;border:1px solid #78b9ff;color:#9fd0ff;border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer;flex-shrink:0';
+    close.addEventListener('click',()=>{generation++;panel.style.display='none';panel.replaceChildren();});
     if(state.storage==='google_sheets') el('small',' ／ Google Sheets保存');
     else if(state.storage==='local') el('small',' ／ ローカル保存（無料Renderでは再起動で消えます）');
     el('div',state.title).style.cssText='font-size:12px;margin:8px 0';
@@ -45,18 +49,31 @@
   }
   function showProduct(product, parent, selectable) {
     const card=el('article',undefined,parent);
-    card.style.cssText='border-top:1px solid #526373;padding:10px 0;margin-top:8px';
-    el('div',product.observed?.name || '詳細を取得できない候補',card);
-    el('small',`型番: ${product.observed?.model || '未取得'} ／ 商品ID: ${product.master_id}`,card);
-    el('div',product.price_yen==null?'価格は要確認':Number(product.price_yen).toLocaleString()+'円',card)
-      .style.cssText='font-size:21px;color:#ffcf79;font-weight:bold;margin:7px 0';
-    if(product.checked_at) el('small','確認: '+product.checked_at,card);
+    card.style.cssText='border-top:1px solid #526373;padding:8px 0;margin-top:6px';
+    const row=el('div',undefined,card);
+    row.style.cssText='display:flex;gap:10px;align-items:flex-start';
+    let full=null;
     if(product.image_url) {
-      const image=el('img',undefined,card); image.src=product.image_url;
-      image.alt='サイトから取得した参考買取価格の元画像';
-      image.style.cssText='display:block;max-width:100%;background:white;margin-top:8px';
+      // 元画像は大きいのでサムネイルにし、タップした時だけ拡大表示する
+      const thumb=el('img',undefined,row); thumb.src=product.image_url;
+      thumb.alt='サイトから取得した参考買取価格の元画像（タップで拡大）';
+      thumb.style.cssText='width:72px;height:72px;object-fit:cover;flex-shrink:0;background:white;border-radius:4px;cursor:zoom-in';
+      thumb.addEventListener('click',()=>{
+        if(full){full.remove();full=null;return;}
+        full=document.createElement('img');full.src=product.image_url;full.alt=thumb.alt;
+        full.style.cssText='display:block;max-width:100%;background:white;margin-top:8px;cursor:zoom-out';
+        full.addEventListener('click',()=>{full.remove();full=null;});
+        card.insertBefore(full,actions);
+      });
     }
-    if(product.error) el('div',product.error,card).style.fontSize='12px';
+    const info=el('div',undefined,row);info.style.cssText='flex:1;min-width:0';
+    el('div',product.observed?.name || '詳細を取得できない候補',info).style.cssText='font-size:13px;line-height:1.4';
+    el('div',product.price_yen==null?'価格は要確認':Number(product.price_yen).toLocaleString()+'円',info)
+      .style.cssText='font-size:18px;color:#ffcf79;font-weight:bold;margin:3px 0';
+    el('small',`型番: ${product.observed?.model || '未取得'} ／ 商品ID: ${product.master_id}`+(product.checked_at?` ／ 確認: ${product.checked_at}`:''),info)
+      .style.cssText='display:block;color:#9fb3c8;font-size:11px';
+    if(product.error) el('div',product.error,info).style.fontSize='12px';
+    const actions=el('div',undefined,card);
     if(selectable && product.observed?.model) button('この商品に紐づける',async()=>{
       const own=generation,jan=current.jan;
       try {
@@ -67,7 +84,7 @@
         el('div',selected.storage==='google_sheets'?'Google Sheetsに紐づけを保存しました。次回のスキャンからこの商品を参照します。':'JANとの紐づけを保存しました。次回のスキャンからこの商品を参照します。',results);
         showProduct(selected.product,results,false);
       } catch(error) { if(own===generation) document.getElementById('trader-progress').textContent=error.message; }
-    },card);
+    },actions);
   }
   async function run(options={}) {
     if(!current)return;
@@ -88,7 +105,14 @@
           results.replaceChildren();
           if(!job.products.length) el('div','候補がありません。検索語を短くして再検索してください。',results);
           else if(!job.linked) el('div','同じ商品か、キャラクター・衣装・PLUS等の版・型番を確認して選んでください。',results);
-          job.products.forEach(product=>showProduct(product,results,!job.linked));
+          const INITIAL=3;
+          job.products.slice(0,INITIAL).forEach(product=>showProduct(product,results,!job.linked));
+          if(job.products.length>INITIAL) {
+            const more=button(`残り ${job.products.length-INITIAL} 件の候補を表示`,()=>{
+              more.remove();
+              job.products.slice(INITIAL).forEach(product=>showProduct(product,results,!job.linked));
+            },results);
+          }
           return;
         }
         await wait(1500);
