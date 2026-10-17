@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from search_terms import search_query, shorter_query
+from search_terms import search_query, shorter_query, trader_query
 from lashinbang_quotes import LashinbangQuotes, search_quotes
 
 CODE = '2000000000015'
@@ -21,6 +21,12 @@ class SearchTermsTests(unittest.TestCase):
         self.assertEqual(shorter_query('BANDAI SPIRITS NARUTO フィギュア カカシ PLUS 限定 A賞'),
                          'NARUTO カカシ PLUS 限定 A賞')
         self.assertEqual(shorter_query('フィギュア カカシ'), 'フィギュア カカシ')
+
+    def test_trader_removes_full_and_half_width_long_marks(self):
+        self.assertEqual(trader_query('ーNARUTOーナルトｰ カカシ 限定 PLUS A賞'),
+                         'NARUTO ナルト カカシ 限定 PLUS A賞')
+        self.assertEqual(trader_query('ｰフィギュアｰ'), 'フィギュア')
+        self.assertEqual(search_query('セーラームーン'), 'セーラームーン')
 
     def test_trader_retries_shorter_query_only_after_empty_result(self):
         # Exercise the actual worker without importing FastAPI/OCR at module scope.

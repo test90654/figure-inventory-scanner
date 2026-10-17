@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from PIL import Image
 from price_ocr import normalize, read_price
 from trader_search import Client, URL, form_payload, parse_results, parse_detail
-from search_terms import search_query, shorter_query
+from search_terms import trader_query as search_query, shorter_query
 
 TTL=6*60*60
 
