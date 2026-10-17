@@ -50,29 +50,25 @@
   function showProduct(product, parent, selectable) {
     const card=el('article',undefined,parent);
     card.style.cssText='border-top:1px solid #526373;padding:8px 0;margin-top:6px';
-    const row=el('div',undefined,card);
-    row.style.cssText='display:flex;gap:10px;align-items:flex-start';
-    let full=null;
-    if(product.image_url) {
-      // 元画像は大きいのでサムネイルにし、タップした時だけ拡大表示する
-      const thumb=el('img',undefined,row); thumb.src=product.image_url;
-      thumb.alt='サイトから取得した参考買取価格の元画像（タップで拡大）';
-      thumb.style.cssText='width:72px;height:72px;object-fit:cover;flex-shrink:0;background:white;border-radius:4px;cursor:zoom-in';
-      thumb.addEventListener('click',()=>{
-        if(full){full.remove();full=null;return;}
-        full=document.createElement('img');full.src=product.image_url;full.alt=thumb.alt;
-        full.style.cssText='display:block;max-width:100%;background:white;margin-top:8px;cursor:zoom-out';
-        full.addEventListener('click',()=>{full.remove();full=null;});
-        card.insertBefore(full,actions);
-      });
-    }
-    const info=el('div',undefined,row);info.style.cssText='flex:1;min-width:0';
+    const info=el('div',undefined,card);
     el('div',product.observed?.name || '詳細を取得できない候補',info).style.cssText='font-size:13px;line-height:1.4';
     el('div',product.price_yen==null?'価格は要確認':Number(product.price_yen).toLocaleString()+'円',info)
       .style.cssText='font-size:18px;color:#ffcf79;font-weight:bold;margin:3px 0';
     el('small',`型番: ${product.observed?.model || '未取得'} ／ 商品ID: ${product.master_id}`+(product.checked_at?` ／ 確認: ${product.checked_at}`:''),info)
       .style.cssText='display:block;color:#9fb3c8;font-size:11px';
     if(product.error) el('div',product.error,info).style.fontSize='12px';
+    if(product.image_url) {
+      // 価格を描いた横長の画像なので、切り抜かずに縦横比を保って全体を表示する。タップで原寸
+      const image=el('img',undefined,card); image.src=product.image_url;
+      image.alt='サイトから取得した参考買取価格の元画像（タップで拡大）';
+      const small='display:block;width:auto;height:auto;max-width:100%;max-height:56px;object-fit:contain;background:white;border-radius:4px;margin-top:6px;cursor:zoom-in';
+      image.style.cssText=small;
+      let enlarged=false;
+      image.addEventListener('click',()=>{
+        enlarged=!enlarged;
+        image.style.cssText=enlarged?small.replace('max-height:56px','max-height:none').replace('zoom-in','zoom-out'):small;
+      });
+    }
     const actions=el('div',undefined,card);
     if(selectable && product.observed?.model) button('この商品に紐づける',async()=>{
       const own=generation,jan=current.jan;
