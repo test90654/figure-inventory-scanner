@@ -1,5 +1,7 @@
 import ast
 import json
+import re
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -45,6 +47,31 @@ class SearchTermsTests(unittest.TestCase):
         candidate = search_quotes(body, max_results=30, allow_partial=True)[0]
         self.assertEqual(candidate['master_id'], '123')
         self.assertEqual(candidate['price_yen'], 600)
+
+
+class InventoryCodeTests(unittest.TestCase):
+    def test_registered_18_digit_code_is_accepted_but_unknown_code_is_not(self):
+        tree = ast.parse(Path(__file__).with_name('inventory_browser_scan.py').read_text(encoding='utf-8'))
+        method = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'validate_lashinbang_item')
+        class HttpError(Exception):
+            def __init__(self, status, detail):
+                self.status_code = status
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / 'stock.db')
+            db = sqlite3.connect(db_path)
+            db.execute('CREATE TABLE stock(jan TEXT,count INTEGER)')
+            db.execute('INSERT INTO stock VALUES(?,?)', ('123456789012345678', 2))
+            db.commit()
+            db.close()
+            namespace = {'re': re, 'sqlite3': sqlite3, 'db_path': db_path, 'HTTPException': HttpError}
+            exec(compile(ast.Module(body=[method], type_ignores=[]), 'inventory_browser_scan.py', 'exec'), namespace)
+            namespace['validate_lashinbang_item']('123456789012345678')
+            with self.assertRaises(HttpError) as unknown:
+                namespace['validate_lashinbang_item']('999999999999999999')
+            self.assertEqual(unknown.exception.status_code, 404)
+            with self.assertRaises(HttpError) as invalid:
+                namespace['validate_lashinbang_item']('not-a-code')
+            self.assertEqual(invalid.exception.status_code, 400)
 
 
 class LinkTests(unittest.TestCase):

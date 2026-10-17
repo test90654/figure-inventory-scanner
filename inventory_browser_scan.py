@@ -619,8 +619,8 @@ class LashinbangSelectRequest(BaseModel):
 
 
 def validate_lashinbang_item(jan):
-  if not re.fullmatch(r"[0-9]{13}", jan):
-    raise HTTPException(400, "在庫コードが不正です")
+  if not re.fullmatch(r"[0-9]{1,32}", jan):
+    raise HTTPException(400, "在庫コードは1～32桁の数字で指定してください")
   with sqlite3.connect(db_path) as conn:
     if not conn.execute("SELECT 1 FROM stock WHERE jan=? AND count>0", (jan,)).fetchone():
       raise HTTPException(404, "保管在庫に商品がありません")
@@ -1328,6 +1328,9 @@ def get_scanner_page():
             .item-quote a { color: #38bdf8; text-decoration: none; }
             
             #stock-items .item-info { min-width: 0; overflow-wrap: anywhere; }
+            .stock-price-totals { background: #263442; border-radius: 6px; padding: 9px; margin: 8px 0; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+            .stock-price-totals strong { color: #ffcf79; font-size: 16px; }
+            .stock-price-totals small { color: #aaa; }
             .stock-price { color: #ffcf79; font-size: 13px; margin-top: 4px; font-weight: bold; }
             .lashinbang-actions { font-size: 10px; margin-top: 3px; }
             .lashinbang-actions a { color: #9fd0ff; }
@@ -1498,8 +1501,10 @@ def get_scanner_page():
                 <div>在庫: <strong id="stock-kinds" style="color:#f1c40f; font-size:18px;">0</strong> 種 / <strong id="stock-total" style="color:#f1c40f; font-size:18px;">0</strong> 点</div>
                 <button class="btn-clear" onclick="loadStock()">🔄 再読込</button>
             </div>
+            <div id="stock-price-totals" class="stock-price-totals" aria-live="polite"></div>
             <h3><span>🗄️ 保管在庫一覧</span></h3>
             <input type="text" id="stock-filter" class="stock-filter" placeholder="🔍 商品名・JAN・保管場所で絞り込み" oninput="renderStock()">
+            <div id="stock-filter-totals" class="stock-price-totals" style="display:none;" aria-live="polite"></div>
             <div id="stock-items"><p style="color: #777; text-align: center; margin: 8px 0;">読み込み中...</p></div>
 
             <button class="btn btn-stock-export" onclick="exportStockText()">📋 在庫リストをテキストでコピー</button>
@@ -2313,7 +2318,35 @@ def get_scanner_page():
                 );
             }
 
-            function stockPriceHtml(quote, label = "トレーダー") {
+            function stockPriceTotals(items, field) {
+                const result = {amount: 0, counted: 0, excluded: 0, stale: 0};
+                for (const item of items) {
+                    const quantity = Number(item.count);
+                    if (!Number.isSafeInteger(quantity) || quantity <= 0) continue;
+                    const quote = item[field];
+                    if (!quote || quote.status !== "ok" || !Number.isSafeInteger(quote.price_yen) || quote.price_yen < 0) {
+                        result.excluded += quantity;
+                        continue;
+                    }
+                    result.amount += quote.price_yen * quantity;
+                    result.counted += quantity;
+                    if (quote.stale || quote.refresh_error) result.stale += quantity;
+                }
+                return result;
+            }
+
+            function stockTotalsHtml(items, label) {
+                const yen = value => `¥${value.toLocaleString("ja-JP")}`;
+                let html = `<div>${label}の買取参考額（単価 × 数量）</div>`;
+                for (const [field, store] of [["trader_quote", "トレーダー"], ["lashinbang_quote", "らしんばん"]]) {
+                    const sum = stockPriceTotals(items, field);
+                    const amount = sum.counted || !sum.excluded ? yen(sum.amount) : "未集計";
+                    html += `<div>${store} <strong>${amount}</strong><br><small>集計 ${sum.counted}点 / 未集計 ${sum.excluded}点${sum.stale ? ` ・ 更新推奨 ${sum.stale}点` : ""}</small></div>`;
+                }
+                return html;
+            }
+
+            function stockPriceHtml(quote, label = "トレーダー", quantity = 1) {
                 const prefix = escapeHtml(label);
                 if (!quote) return `<div class="stock-price"><small>${prefix}：未取得</small></div>`;
                 const checking = quote.pending ? " ・ 更新中" : "";
@@ -2327,7 +2360,8 @@ def get_scanner_page():
                     const labels = {unlinked:"未紐づけ", unavailable:"取得できませんでした", needs_review:"要確認", pending:"取得中", not_found:"買取掲載なし", unsupported:"商品名で検索してください", error:"取得失敗"};
                     return `<div class="stock-price"><small>${prefix}：${labels[quote.status] || "要確認"}${checking}${quote.error_message ? `（${escapeHtml(quote.error_message)}）` : ""}</small></div>`;
                 }
-                return `<div class="stock-price">${prefix} ¥${Number(quote.price_yen).toLocaleString("ja-JP")} <small>／個</small><br><small>${escapeHtml(checked)}${quote.stale ? " ・ 更新推奨" : ""}${checking}${quote.refresh_error ? " ・ 更新失敗（前回値）" : ""}</small></div>`;
+                const subtotal = quantity > 1 ? `<br><small>${quantity}点 小計 ¥${(quote.price_yen * quantity).toLocaleString("ja-JP")}</small>` : "";
+                return `<div class="stock-price">${prefix} ¥${Number(quote.price_yen).toLocaleString("ja-JP")} <small>／個</small>${subtotal}<br><small>${escapeHtml(checked)}${quote.stale ? " ・ 更新推奨" : ""}${checking}${quote.refresh_error ? " ・ 更新失敗（前回値）" : ""}</small></div>`;
             }
 
             window.refreshLashinbang = async function(jan) {
@@ -2349,6 +2383,11 @@ def get_scanner_page():
                 stockItems.forEach(s => total += s.count);
                 document.getElementById("stock-kinds").innerText = stockItems.length;
                 document.getElementById("stock-total").innerText = total;
+                document.getElementById("stock-price-totals").innerHTML = stockTotalsHtml(stockItems, "在庫全体");
+                const filteredTotals = document.getElementById("stock-filter-totals");
+                const filtering = document.getElementById("stock-filter").value.trim().length > 0;
+                filteredTotals.style.display = filtering ? "block" : "none";
+                filteredTotals.innerHTML = filtering ? stockTotalsHtml(items, "絞り込み結果") : "";
 
                 if (items.length === 0) {
                     container.innerHTML = `<p style="color: #777; text-align: center; margin: 8px 0;">${stockItems.length === 0 ? "まだ在庫は登録されていません" : "該当する在庫がありません"}</p>`;
@@ -2367,12 +2406,12 @@ def get_scanner_page():
                             <div class="item-info">
                                 <div class="item-title">${escapeHtml(item.title)}</div>
                                 <div class="item-jan">コード: ${escapeHtml(item.jan)}</div>
-                                ${stockPriceHtml(item.trader_quote)}
-                                ${stockPriceHtml(item.lashinbang_quote, "らしんばん")}
+                                ${stockPriceHtml(item.trader_quote, "トレーダー", item.count)}
+                                ${stockPriceHtml(item.lashinbang_quote, "らしんばん", item.count)}
                                 <div class="lashinbang-actions">
                                     <button type="button" data-act="lashinbang-search" ${attrs}>${item.lashinbang_quote?.linked ? "紐づけ変更" : "商品名で検索"}</button>
-                                    ${(!isInternalCode(item.jan) || item.lashinbang_quote?.linked) ? `<button type="button" data-act="lashinbang" ${attrs} ${item.lashinbang_quote?.pending ? "disabled" : ""}>更新</button>` : ""}
-                                    ${!isInternalCode(item.jan) ? `<a href="https://shop.lashinbang.com/kaitori/list?jan=${encodeURIComponent(item.jan)}" target="_blank" rel="noopener noreferrer">なっとく買取</a>` : ""}
+                                    ${((/^[0-9]{13}$/.test(item.jan) && !isInternalCode(item.jan)) || item.lashinbang_quote?.linked) ? `<button type="button" data-act="lashinbang" ${attrs} ${item.lashinbang_quote?.pending ? "disabled" : ""}>更新</button>` : ""}
+                                    ${(/^[0-9]{13}$/.test(item.jan) && !isInternalCode(item.jan)) ? `<a href="https://shop.lashinbang.com/kaitori/list?jan=${encodeURIComponent(item.jan)}" target="_blank" rel="noopener noreferrer">なっとく買取</a>` : ""}
                                 </div>
                                 ${loc}
                             </div>
