@@ -11,7 +11,6 @@ from contextlib import closing, contextmanager
 from urllib.parse import urlparse
 
 import requests
-from bs4 import BeautifulSoup
 
 BASE = "https://shop.lashinbang.com"
 TTL = 6 * 3600
@@ -26,7 +25,7 @@ def supported_jan(jan):
     return bool(re.fullmatch(r"[0-9]{13}", jan)) and not jan.startswith("20")
 
 
-def search_paths(body, jan):
+def search_quotes(body, jan):
     # Same JSONP search used by the official kaitori page; never execute it.
     match = re.fullmatch(r"\s*callback\s*\((.*)\);?\s*", body, re.DOTALL)
     if match is None:
@@ -42,7 +41,8 @@ def search_paths(body, jan):
         return None
     if len(items) != count:
         raise ValueError("Incomplete buyback results")
-    paths = []
+    quotes = []
+    seen = set()
     for item in items:
         # number10=1 is the standard buyback product, excluding retail stock.
         if item.get("keyword2", "").strip() != jan or item.get("number10") != 1:
@@ -50,34 +50,18 @@ def search_paths(body, jan):
         product_id = str(item.get("itemid", ""))
         if not re.fullmatch(r"[0-9]+", product_id):
             raise ValueError("Invalid buyback product ID")
-        path = "/kaitori/detail/" + product_id
-        if path not in paths:
-            paths.append(path)
-    return paths
-
-
-def parse_detail(html, jan, path):
-    soup = BeautifulSoup(html, "html.parser")
-    item = soup.select_one("#item_data")
-    if item is None:
-        raise ValueError("Unrecognized buyback detail page")
-    codes = []
-    for row in item.select("table tr"):
-        label, value = row.find("th"), row.find("td")
-        if label and value and label.get_text(strip=True) == "JANコード":
-            codes.append(value.get_text(strip=True))
-    if codes != [jan]:
-        return None
-    price = item.select_one(".kaitori_price_box .price")
-    text = price.get_text("", strip=True) if price else ""
-    match = re.fullmatch(r"([0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)円", text)
-    title = item.select_one("h1")
-    return {
-        "status": "ok" if match else "needs_review",
-        "price_yen": int(match.group(1).replace(",", "")) if match else None,
-        "title": title.get_text(strip=True) if title else "",
-        "source_url": BASE + path,
-    }
+        if product_id in seen:
+            continue
+        seen.add(product_id)
+        # The official buyback list displays max(number5, number19).
+        # `price` is the retail sale price and must never be used here.
+        values = [item.get(key) for key in ("number5", "number19") if item.get(key) is not None]
+        valid = bool(values) and all(type(value) is int and value >= 0 for value in values)
+        quotes.append({"status": "ok" if valid else "needs_review",
+                       "price_yen": max(values) if valid else None,
+                       "title": item.get("title", ""),
+                       "source_url": BASE + "/kaitori/detail/" + product_id})
+    return quotes
 
 
 def lookup_quote(jan, session=None):
@@ -99,16 +83,15 @@ def lookup_quote(jan, session=None):
         params = {"k2": jan, "s1": "2", "n10c": "1:1", "n5l": "1",
                   "searchbox": "1", "limit": "6", "o": "0", "sort": "Score,Number18",
                   "controller": "lashinbang_kaitori", "callback": "callback"}
-        paths = search_paths(fetch("https://lashinbang-f-s.snva.jp/", params), jan)
-        if paths is None:
+        matches = search_quotes(fetch("https://lashinbang-f-s.snva.jp/", params), jan)
+        if matches is None:
             return {"status": "needs_review", "price_yen": None}
-        matches = []
-        for path in paths:
-            quote = parse_detail(fetch(BASE + path), jan, path)
-            if quote is not None:
-                matches.append(quote)
         if len(matches) == 1:
             return matches[0]
+        if matches and all(quote["status"] == "ok" for quote in matches):
+            prices = [quote["price_yen"] for quote in matches]
+            return {"status": "multiple", "price_yen": None,
+                    "price_min": min(prices), "price_max": max(prices), "candidates": matches}
         return {"status": "needs_review" if matches else "not_found", "price_yen": None}
     finally:
         if own_session:
@@ -181,10 +164,21 @@ class LashinbangQuotes:
                 quote["checked_at"] = dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).isoformat(timespec="seconds")
                 quote["stale"] = False
                 retry_at = time.time() + TTL
-            except Exception:
+            except Exception as exc:
                 logging.getLogger(__name__).exception("Lashinbang buyback lookup failed")
                 old, _ = self.cached(jan)
                 quote = {**old, "stale": True, "refresh_error": True} if old else {"status": "error", "price_yen": None}
+                if isinstance(exc, requests.HTTPError) and exc.response is not None:
+                    message = f"接続先がHTTP {exc.response.status_code}を返しました"
+                elif isinstance(exc, requests.Timeout):
+                    message = "接続がタイムアウトしました"
+                elif isinstance(exc, requests.ConnectionError):
+                    message = "接続できませんでした"
+                elif isinstance(exc, (ValueError, KeyError, TypeError)):
+                    message = "検索データを読み取れませんでした"
+                else:
+                    message = "価格を取得できませんでした"
+                quote["error_message"] = message
                 retry_at = time.time() + ERROR_TTL
             with self.connect() as db:
                 db.execute("INSERT OR REPLACE INTO lashinbang_quotes VALUES(?,?,?)", (jan, json.dumps(quote, ensure_ascii=False), retry_at))

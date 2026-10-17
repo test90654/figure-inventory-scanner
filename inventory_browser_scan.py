@@ -2260,11 +2260,16 @@ def get_scanner_page():
                 const prefix = escapeHtml(label);
                 if (!quote) return `<div class="stock-price"><small>${prefix}：未取得</small></div>`;
                 const checking = quote.pending ? " ・ 更新中" : "";
+                const checked = quote.checked_at ? `確認 ${quote.checked_at.replace("T", " ").slice(0, 16)}` : "";
+                if (quote.status === "multiple") {
+                    const amount = value => Number(value).toLocaleString("ja-JP");
+                    const range = quote.price_min === quote.price_max ? `¥${amount(quote.price_min)}` : `¥${amount(quote.price_min)}～¥${amount(quote.price_max)}`;
+                    return `<div class="stock-price">${prefix} ${range}<br><small>同じJANに${quote.candidates.length}商品・候補を確認${checking}${quote.refresh_error ? " ・ 更新失敗（前回値）" : ""}</small><br><small>${escapeHtml(checked)}${quote.stale ? " ・ 更新推奨" : ""}</small></div>`;
+                }
                 if (quote.status !== "ok") {
                     const labels = {unlinked:"未紐づけ", unavailable:"取得できませんでした", needs_review:"要確認", pending:"取得中", not_found:"買取掲載なし", unsupported:"独自コード対象外", error:"取得失敗"};
-                    return `<div class="stock-price"><small>${prefix}：${labels[quote.status] || "要確認"}${checking}</small></div>`;
+                    return `<div class="stock-price"><small>${prefix}：${labels[quote.status] || "要確認"}${checking}${quote.error_message ? `（${escapeHtml(quote.error_message)}）` : ""}</small></div>`;
                 }
-                const checked = quote.checked_at ? `確認 ${quote.checked_at.replace("T", " ").slice(0, 16)}` : "";
                 return `<div class="stock-price">${prefix} ¥${Number(quote.price_yen).toLocaleString("ja-JP")} <small>／個</small><br><small>${escapeHtml(checked)}${quote.stale ? " ・ 更新推奨" : ""}${checking}${quote.refresh_error ? " ・ 更新失敗（前回値）" : ""}</small></div>`;
             }
 
