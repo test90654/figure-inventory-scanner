@@ -6,11 +6,13 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from urllib.parse import urlparse
 
 import requests
+from search_terms import search_query
 
 BASE = "https://shop.lashinbang.com"
 TTL = 6 * 3600
@@ -25,7 +27,7 @@ def supported_jan(jan):
     return bool(re.fullmatch(r"[0-9]{13}", jan)) and not jan.startswith("20")
 
 
-def search_quotes(body, jan):
+def search_quotes(body, jan=None, max_results=5, allow_partial=False):
     # Same JSONP search used by the official kaitori page; never execute it.
     match = re.fullmatch(r"\s*callback\s*\((.*)\);?\s*", body, re.DOTALL)
     if match is None:
@@ -37,15 +39,15 @@ def search_quotes(body, jan):
     count = info["hitnum"]
     if type(count) is not int or count < 0:
         raise ValueError("Invalid buyback result count")
-    if count > 5:
+    if count > max_results and not allow_partial:
         return None
-    if len(items) != count:
+    if len(items) != min(count, max_results):
         raise ValueError("Incomplete buyback results")
     quotes = []
     seen = set()
     for item in items:
         # number10=1 is the standard buyback product, excluding retail stock.
-        if item.get("keyword2", "").strip() != jan or item.get("number10") != 1:
+        if (jan is not None and item.get("keyword2", "").strip() != jan) or item.get("number10") != 1:
             continue
         product_id = str(item.get("itemid", ""))
         if not re.fullmatch(r"[0-9]+", product_id):
@@ -59,7 +61,9 @@ def search_quotes(body, jan):
         valid = bool(values) and all(type(value) is int and value >= 0 for value in values)
         quotes.append({"status": "ok" if valid else "needs_review",
                        "price_yen": max(values) if valid else None,
-                       "title": item.get("title", ""),
+                       "title": item.get("title", ""), "master_id": product_id,
+                       "remote_jan": item.get("keyword2", "").strip(),
+                       "image_url": item.get("image", "") if urlparse(item.get("image", "")).scheme == "https" and urlparse(item.get("image", "")).netloc in ("img.lashinbang.com", "devimg.lashinbang.com") else "",
                        "source_url": BASE + "/kaitori/detail/" + product_id})
     return quotes
 
@@ -98,6 +102,23 @@ def lookup_quote(jan, session=None):
             client.close()
 
 
+def catalog_search(query=None, jan=None):
+    params = {"s1": "2", "n10c": "1:1", "n5l": "1", "limit": "30", "o": "0",
+              "sort": "Score,Number18", "controller": "lashinbang_kaitori", "callback": "callback"}
+    if jan:
+        params["k2"] = jan
+    else:
+        params["q"] = search_query(query)
+        if not params["q"]:
+            raise ValueError("検索語を入力してください")
+    response = requests.get("https://lashinbang-f-s.snva.jp/", params=params, headers=HEADERS, timeout=(5, 15))
+    response.raise_for_status()
+    if urlparse(response.url).netloc != "lashinbang-f-s.snva.jp":
+        raise ValueError("検索先が変わりました")
+    response.encoding = "utf-8"
+    return search_quotes(response.text, jan=jan, max_results=30, allow_partial=True)
+
+
 class LashinbangQuotes:
     def __init__(self, db_path, lookup=lookup_quote):
         self.db_path = str(db_path)
@@ -107,14 +128,93 @@ class LashinbangQuotes:
         self.pending = set()
         self.version = 0
         self.next_request = 0
+        self.link_store = None
+        self.links_restored = False
+        self.link_guard = threading.RLock()
+        self.searches = {}
         with self.connect() as db:
             db.execute("CREATE TABLE IF NOT EXISTS lashinbang_quotes(jan TEXT PRIMARY KEY, data TEXT NOT NULL, retry_at REAL NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS lashinbang_links(code TEXT PRIMARY KEY, data TEXT NOT NULL)")
 
     @contextmanager
     def connect(self):
         with closing(sqlite3.connect(self.db_path, timeout=30)) as db:
             with db:
                 yield db
+
+    def ensure_links(self):
+        if self.link_store is None or self.links_restored:
+            return
+        with self.link_guard:
+            if self.links_restored:
+                return
+            links = self.link_store.load()
+            with self.connect() as db:
+                for code, link in links.items():
+                    db.execute("INSERT OR REPLACE INTO lashinbang_links VALUES(?,?)", (code, json.dumps(link, ensure_ascii=False)))
+            self.links_restored = True
+
+    def link(self, code):
+        self.ensure_links()
+        with self.connect() as db:
+            row = db.execute("SELECT data FROM lashinbang_links WHERE code=?", (code,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def inventory_title(self, code):
+        with self.connect() as db:
+            row = db.execute("SELECT title FROM items WHERE jan=?", (code,)).fetchone()
+        if row is None:
+            raise ValueError("在庫商品が見つかりません")
+        return row[0] or ""
+
+    def name_candidates(self, code, query):
+        title = self.inventory_title(code)
+        query = search_query(query or title)
+        candidates = catalog_search(query=query)
+        token = uuid.uuid4().hex
+        with self.guard:
+            self.searches = {key: value for key, value in self.searches.items() if time.time()-value['created'] < 900}
+            if len(self.searches) >= 100:
+                raise ValueError("検索が混み合っています。少し待ってください")
+            self.searches[token] = {'created': time.time(), 'code': code, 'title': title, 'query': query, 'candidates': candidates}
+        return {'token': token, 'query': query, 'candidates': candidates, 'has_more': len(candidates) == 30,
+                'storage': 'google_sheets' if self.link_store is not None else 'local'}
+
+    def select(self, code, token, master_id):
+        with self.guard:
+            search = self.searches.get(token)
+        if not search or search['code'] != code or time.time()-search['created'] >= 900:
+            raise ValueError("候補が失効しました。再検索してください")
+        candidate = next((item for item in search['candidates'] if item['master_id'] == master_id), None)
+        if candidate is None or not candidate.get('title'):
+            raise ValueError("検索結果から商品を選んでください")
+        with self.link_guard:
+            if self.inventory_title(code) != search['title']:
+                raise ValueError("在庫商品名が変わりました。再検索してください")
+            self.ensure_links()
+            stamp = dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).isoformat(timespec="seconds")
+            link = {'schema': 1, 'code': code, 'master_id': master_id, 'title': candidate['title'],
+                    'remote_jan': candidate.get('remote_jan', ''), 'inventory_title': search['title'],
+                    'query': search['query'], 'linked_at': stamp}
+            if self.link_store is not None:
+                self.link_store.save(link)  # Acknowledge durable storage before local success.
+            with self.connect() as db:
+                db.execute("INSERT OR REPLACE INTO lashinbang_links VALUES(?,?)", (code, json.dumps(link, ensure_ascii=False)))
+                quote = {**candidate, 'checked_at': stamp, 'linked': True}
+                db.execute("INSERT OR REPLACE INTO lashinbang_quotes VALUES(?,?,?)", (code, json.dumps(quote, ensure_ascii=False), time.time()+TTL))
+            with self.guard:
+                self.version += 1
+        return quote
+
+    def linked_quote(self, link):
+        if self.inventory_title(link['code']) != link['inventory_title']:
+            return {'status': 'needs_review', 'price_yen': None, 'linked': True}
+        remote_jan = link.get('remote_jan', '')
+        candidates = catalog_search(jan=remote_jan) if supported_jan(remote_jan) else catalog_search(query=link['title'])
+        candidate = next((item for item in candidates if item['master_id'] == link['master_id']), None)
+        if candidate is None or search_query(candidate['title']) != search_query(link['title']):
+            return {'status': 'needs_review', 'price_yen': None, 'linked': True}
+        return {**candidate, 'linked': True}
 
     def cached(self, jan):
         with self.connect() as db:
@@ -123,23 +223,29 @@ class LashinbangQuotes:
 
     def get_many(self, jans):
         wanted = set(jans)
+        if wanted:
+            self.ensure_links()
         with self.connect() as db:
             cached = {row[0]: (json.loads(row[1]), row[2]) for row in db.execute("SELECT jan,data,retry_at FROM lashinbang_quotes") if row[0] in wanted}
         result = {}
         for jan in wanted:
-            if not supported_jan(jan):
-                result[jan] = {"status": "unsupported", "price_yen": None}
+            link = self.link(jan)
+            if link and self.inventory_title(jan) != link["inventory_title"]:
+                result[jan] = {"status": "needs_review", "price_yen": None, "linked": True}
+                continue
+            if not supported_jan(jan) and not link:
+                result[jan] = {"status": "unlinked", "price_yen": None}
                 continue
             quote, retry_at = cached.get(jan, (None, 0))
             self.schedule(jan, cached_retry_at=retry_at)
             with self.guard:
                 pending = jan in self.pending
-            result[jan] = {**(quote or {"status": "pending", "price_yen": None}), "pending": pending,
+            result[jan] = {**(quote or {"status": "pending", "price_yen": None}), "pending": pending, "linked": bool(link),
                            "stale": bool(quote and (quote.get("stale") or time.time() >= retry_at))}
         return result
 
     def schedule(self, jan, force=False, cached_retry_at=None):
-        if not supported_jan(jan):
+        if not supported_jan(jan) and not self.link(jan):
             return False
         retry_at = self.cached(jan)[1] if cached_retry_at is None else cached_retry_at
         if not force and time.time() < retry_at:
@@ -157,10 +263,18 @@ class LashinbangQuotes:
         return True
 
     def refresh(self, jan):
+        with self.link_guard:
+            self._refresh(jan)
+
+    def _refresh(self, jan):
         try:
             time.sleep(max(0, self.next_request - time.monotonic()))
             try:
-                quote = self.lookup(jan)
+                # Serialize publication with selection so an older queued fetch cannot
+                # overwrite the price of a newly selected product.
+                with self.link_guard:
+                    link = self.link(jan)
+                    quote = self.linked_quote(link) if link else self.lookup(jan)
                 quote["checked_at"] = dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).isoformat(timespec="seconds")
                 quote["stale"] = False
                 retry_at = time.time() + TTL
