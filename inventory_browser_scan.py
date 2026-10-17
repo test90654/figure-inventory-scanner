@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import time
 import traceback
+import uuid
 import unicodedata
 import urllib.parse
 from bs4 import BeautifulSoup
@@ -621,6 +622,144 @@ def delete_stock(data: StockDeleteRequest, background_tasks: BackgroundTasks):
 
 
 # ==========================================
+# 持込リストの端末間同期（スマホでスキャン → PCで閲覧など）
+# 作業枠(box)ごとにサーバーへ保存し、各端末はバージョン番号をポーリングして差分を取り込む
+# ==========================================
+
+# サーバー再起動の検知用（Render等ではディスクが揮発するため、端末側の控えから復元させる）
+SERVER_INSTANCE_ID = uuid.uuid4().hex
+_cart_lock = threading.Lock()
+
+
+def _init_cart_table():
+  conn = sqlite3.connect(db_path)
+  conn.execute("""
+        CREATE TABLE IF NOT EXISTS carts (
+            box TEXT PRIMARY KEY,
+            data TEXT NOT NULL DEFAULT '{}',
+            version INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT
+        )
+    """)
+  conn.commit()
+  conn.close()
+
+
+_init_cart_table()
+
+
+def _load_cart(cursor, box: str):
+  cursor.execute("SELECT data, version FROM carts WHERE box = ?", (box,))
+  row = cursor.fetchone()
+  if not row:
+    return {}, 0
+  try:
+    return json.loads(row[0]), row[1]
+  except ValueError:
+    return {}, row[1]
+
+
+CART_ITEM_FIELDS = ("title", "imageUrl", "quote_label", "source_url")
+
+
+class CartOpRequest(BaseModel):
+  box: str = "default"
+  op: str  # add / delta / set_info / remove / clear / replace
+  jan: str = ""
+  delta: int = 0
+  item: dict = {}
+  items: dict = {}
+
+
+def _apply_cart_op(cart: dict, req: CartOpRequest) -> dict:
+  jan = req.jan
+  info = {k: v for k, v in (req.item or {}).items() if k in CART_ITEM_FIELDS}
+  if req.op == "add":
+    if jan in cart:
+      cart[jan]["count"] = int(cart[jan].get("count", 0)) + 1
+      cart[jan].update({k: v for k, v in info.items() if v})
+    else:
+      cart[jan] = {
+          "jan": jan,
+          "title": info.get("title") or "",
+          "imageUrl": info.get("imageUrl") or "",
+          "count": 1,
+          "quote_label": info.get("quote_label") or "流通 / 商品カタログ",
+          "source_url": info.get("source_url") or "#",
+      }
+  elif req.op == "delta":
+    if jan in cart:
+      cart[jan]["count"] = int(cart[jan].get("count", 0)) + req.delta
+      if cart[jan]["count"] <= 0:
+        del cart[jan]
+  elif req.op == "set_info":
+    if jan in cart:
+      cart[jan].update(info)
+  elif req.op == "remove":
+    cart.pop(jan, None)
+  elif req.op == "clear":
+    cart = {}
+  elif req.op == "replace":
+    cart = {
+        k: v
+        for k, v in (req.items or {}).items()
+        if isinstance(v, dict) and int(v.get("count", 0)) > 0
+    }
+  else:
+    raise HTTPException(status_code=400, detail=f"不明な操作です: {req.op}")
+  return cart
+
+
+@app.get("/api/cart")
+def get_cart(box: str = "default"):
+  conn = sqlite3.connect(db_path)
+  items, version = _load_cart(conn.cursor(), box)
+  conn.close()
+  return {"items": items, "version": version, "instance": SERVER_INSTANCE_ID}
+
+
+@app.post("/api/cart/op")
+def cart_op(req: CartOpRequest):
+  with _cart_lock:
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    items, version = _load_cart(cursor, req.box)
+    items = _apply_cart_op(items, req)
+    version += 1
+    cursor.execute(
+        """
+            INSERT INTO carts (box, data, version, updated_at) VALUES (?, ?, ?, ?)
+            ON CONFLICT(box) DO UPDATE SET
+                data = excluded.data, version = excluded.version, updated_at = excluded.updated_at
+        """,
+        (
+            req.box,
+            json.dumps(items, ensure_ascii=False),
+            version,
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+    )
+    conn.commit()
+    conn.close()
+  return {"items": items, "version": version, "instance": SERVER_INSTANCE_ID}
+
+
+@app.get("/api/sync_state")
+def sync_state(box: str = "default"):
+  """端末が数秒おきに呼ぶ軽量エンドポイント。変化があった時だけ本体を取りに行く"""
+  conn = sqlite3.connect(db_path)
+  cursor = conn.cursor()
+  cursor.execute("SELECT version FROM carts WHERE box = ?", (box,))
+  row = cursor.fetchone()
+  conn.close()
+  return {
+      "instance": SERVER_INSTANCE_ID,
+      "cart_version": row[0] if row else 0,
+      "stock_version": _stock_sync_gen,
+  }
+
+
+# ==========================================
 # 商品名検索 / バーコード無し商品の独自コード発行
 # ==========================================
 
@@ -1142,6 +1281,15 @@ def get_scanner_page():
             .preview-card { background: #1e1e1e; padding: 12px; border-radius: 8px; border: 1px solid #444; width: 100%; max-width: 380px; box-sizing: border-box; text-align: left; }
             .preview-img { width: 100%; height: auto; border-radius: 4px; border: 1px solid #555; display: block; }
 
+            .sync-bar { display: flex; justify-content: center; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+            .sync-status { font-size: 11px; color: #888; }
+            .sync-status.ok { color: #2ecc71; }
+            .sync-status.busy { color: #f1c40f; }
+            .sync-status.err { color: #ff6b6b; }
+            .btn-share { background: transparent; color: #38bdf8; border: 1px solid #38bdf8; border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer; }
+            #share-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); display: none; justify-content: center; align-items: center; z-index: 1000; }
+            #share-qr { background: #fff; padding: 12px; border-radius: 8px; display: inline-block; margin: 8px auto; }
+            .share-url { font-size: 11px; color: #ccc; word-break: break-all; background: #333; padding: 6px; border-radius: 4px; }
             .mode-tabs { display: flex; max-width: 380px; margin: 0 auto 10px auto; background: #1e1e1e; border-radius: 8px; padding: 4px; gap: 4px; border: 1px solid #333; }
             .mode-tab { flex: 1; background: transparent; color: #aaa; border: none; padding: 10px 6px; border-radius: 6px; font-weight: bold; font-size: 14px; cursor: pointer; }
             .mode-tab.active { background: #00ffcc; color: #000; }
@@ -1159,6 +1307,23 @@ def get_scanner_page():
     <body>
         <h2>📦 買取インベントリ</h2>
         <div id="box-tag-display" class="box-tag">作業枠: メイン</div>
+        <div class="sync-bar">
+            <span id="sync-status" class="sync-status">☁ 接続中...</span>
+            <button class="btn-share" onclick="openShareModal()">📱 他の端末で開く</button>
+        </div>
+
+        <div id="share-overlay" onclick="if (event.target === this) closeShareModal()">
+            <div class="modal-content" style="text-align:center;">
+                <h3>📱 他の端末で開く</h3>
+                <p style="font-size: 11px; color: #ccc;">同じ作業枠のリスト・保管在庫が自動で同期されます。スマホで読み取るか、URLをPCで開いてください。</p>
+                <div id="share-qr"></div>
+                <div id="share-url" class="share-url"></div>
+                <div class="modal-btns">
+                    <button class="btn" style="background:#555; margin-top:0;" onclick="closeShareModal()">閉じる</button>
+                    <button class="btn" style="background:#3498db; margin-top:0;" onclick="copyShareUrl()">URLをコピー</button>
+                </div>
+            </div>
+        </div>
         <p>カメラにかざすか、バーコードを手打ち入力</p>
 
         <div class="mode-tabs">
@@ -1333,7 +1498,7 @@ def get_scanner_page():
                 }
                 document.getElementById("stock-location-input").value = lsGet(LOCATION_KEY) || "";
                 setMode(urlParams.get('mode') || lsGet(MODE_KEY) || "cart");
-                const saved = localStorage.getItem(STORAGE_KEY);
+                const saved = lsGet(STORAGE_KEY);
                 if (saved) {
                     try {
                         cart = JSON.parse(saved);
@@ -1342,10 +1507,11 @@ def get_scanner_page():
                         cart = {};
                     }
                 }
+                initCartSync();
             });
 
             function saveToStorage() {
-                localStorage.setItem(STORAGE_KEY, JSON.stringify(cart));
+                lsSet(STORAGE_KEY, JSON.stringify(cart));
             }
 
             window.clearCart = function() {
@@ -1354,6 +1520,7 @@ def get_scanner_page():
                     cart = {};
                     saveToStorage();
                     updateCartUI();
+                    queueCartOp({ op: "clear" });
                     document.getElementById("result-banner").style.display = "none";
                     document.getElementById("preview-container").innerHTML = "";
                 }
@@ -1520,6 +1687,7 @@ def get_scanner_page():
                     };
                 }
                 updateCartUI();
+                queueCartOp({ op: "add", jan: code, item: cartItemInfo(cart[code]) });
 
                 document.getElementById("res-title").innerText = cart[code].title;
                 document.getElementById("res-jan").innerText = "コード: " + code;
@@ -1672,6 +1840,7 @@ def get_scanner_page():
                         cart[jan].quote_label = data.quote_label;
                         cart[jan].source_url = data.source_url;
                         updateCartUI();
+                        queueCartOp({ op: "set_info", jan: jan, item: cartItemInfo(cart[jan]) });
                         
                         currentBannerJan = jan;
                         document.getElementById("res-title").innerText = data.title;
@@ -1749,6 +1918,7 @@ def get_scanner_page():
                     cart[code].count += delta;
                     if (cart[code].count <= 0) delete cart[code];
                     updateCartUI();
+                    queueCartOp({ op: "delta", jan: code, delta: delta });
                     if (currentBannerJan === code) {
                         if (cart[code]) {
                             document.getElementById("res-count").innerText = cart[code].count;
@@ -1771,6 +1941,7 @@ def get_scanner_page():
                     document.getElementById("result-banner").style.display = "none";
                 }
                 updateCartUI();
+                queueCartOp({ op: "remove", jan: code });
             }
 
             function updateCartUI(doSave = true) {
@@ -2210,6 +2381,169 @@ def get_scanner_page():
                 document.getElementById("modal-title").value = document.getElementById("search-input").value.trim();
                 document.getElementById("modal-heading").innerText = "🏷️ バーコード無し商品の登録";
                 document.getElementById("modal-desc").innerText = "JANコードは空欄のままでOKです。独自コード（20から始まる13桁）を自動で発行して登録します。次回からは商品名検索で呼び出せます。";
+            }
+
+            // ==========================================
+            // 端末間同期（持込リスト / 保管在庫）
+            // ==========================================
+
+            const SYNC_META_KEY = `figure_scanner_sync_${currentBox}`;
+            const SYNC_INTERVAL_MS = 3000;
+            let cartVersion = 0;
+            let serverInstance = "";
+            let stockVersion = null;
+            let pendingCartOps = 0;
+            let cartOpChain = Promise.resolve();
+            let cartDirty = false; // 送信に失敗した変更が端末内に残っている
+
+            function cartItemInfo(item) {
+                return { title: item.title, imageUrl: item.imageUrl, quote_label: item.quote_label, source_url: item.source_url };
+            }
+
+            function setSyncStatus(cls, text) {
+                const el = document.getElementById("sync-status");
+                el.className = "sync-status " + cls;
+                el.innerText = text;
+            }
+
+            function saveSyncMeta() {
+                lsSet(SYNC_META_KEY, JSON.stringify({ dirty: cartDirty }));
+            }
+
+            function applyServerCart(resp) {
+                cartVersion = resp.version;
+                serverInstance = resp.instance;
+                cart = resp.items || {};
+                updateCartUI();
+                if (currentMode === "cart" && currentBannerJan) {
+                    if (cart[currentBannerJan]) {
+                        document.getElementById("res-count").innerText = cart[currentBannerJan].count;
+                    } else {
+                        document.getElementById("result-banner").style.display = "none";
+                    }
+                }
+                setSyncStatus("ok", "☁ 同期済み");
+            }
+
+            async function postCartOp(op) {
+                const res = await fetch('/api/cart/op', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(Object.assign({ box: currentBox }, op))
+                });
+                if (!res.ok) throw new Error("HTTP " + res.status);
+                return await res.json();
+            }
+
+            // 操作は順番どおりに送る。画面は先に更新済みなので、最後の応答だけでサーバーの状態に揃える
+            function queueCartOp(op) {
+                pendingCartOps++;
+                setSyncStatus("busy", "⏳ 同期中...");
+                cartOpChain = cartOpChain.then(async () => {
+                    try {
+                        const resp = cartDirty
+                            ? await postCartOp({ op: "replace", items: cart })
+                            : await postCartOp(op);
+                        cartDirty = false;
+                        saveSyncMeta();
+                        if (pendingCartOps === 1) applyServerCart(resp);
+                    } catch (e) {
+                        cartDirty = true;
+                        saveSyncMeta();
+                        setSyncStatus("err", "⚠ オフライン（端末内に保存中）");
+                    } finally {
+                        pendingCartOps--;
+                    }
+                });
+            }
+
+            async function initCartSync() {
+                try {
+                    const meta = JSON.parse(lsGet(SYNC_META_KEY) || "{}");
+                    cartDirty = !!meta.dirty;
+                } catch (e) {}
+                try {
+                    const res = await fetch(`/api/cart?box=${encodeURIComponent(currentBox)}`);
+                    if (!res.ok) throw new Error("HTTP " + res.status);
+                    const resp = await res.json();
+                    const hasLocal = Object.keys(cart).length > 0;
+                    // サーバーにまだ無い（初回 or 再起動でデータが消えた）、または未送信の変更がある → 端末の内容を送る
+                    if (hasLocal && (resp.version === 0 || cartDirty)) {
+                        cartDirty = true;
+                        queueCartOp({ op: "replace", items: cart });
+                    } else {
+                        applyServerCart(resp);
+                    }
+                } catch (e) {
+                    setSyncStatus("err", "⚠ オフライン（端末内に保存中）");
+                }
+                setInterval(pollSync, SYNC_INTERVAL_MS);
+                document.addEventListener("visibilitychange", () => { if (!document.hidden) pollSync(); });
+            }
+
+            async function pollSync() {
+                if (document.hidden || pendingCartOps > 0) return;
+                try {
+                    const res = await fetch(`/api/sync_state?box=${encodeURIComponent(currentBox)}`);
+                    if (!res.ok) throw new Error("HTTP " + res.status);
+                    const st = await res.json();
+
+                    if (cartDirty) {
+                        queueCartOp({ op: "replace", items: cart });
+                    } else if (st.instance !== serverInstance && st.cart_version === 0 && Object.keys(cart).length > 0) {
+                        // サーバーが再起動してリストが消えた → この端末の控えから復元
+                        queueCartOp({ op: "replace", items: cart });
+                    } else if (st.cart_version !== cartVersion || st.instance !== serverInstance) {
+                        const r = await fetch(`/api/cart?box=${encodeURIComponent(currentBox)}`);
+                        if (r.ok && pendingCartOps === 0) applyServerCart(await r.json());
+                    } else {
+                        setSyncStatus("ok", "☁ 同期済み");
+                    }
+
+                    if (stockVersion !== null && st.stock_version !== stockVersion && currentMode === "stock") {
+                        loadStock();
+                    }
+                    stockVersion = st.stock_version;
+                } catch (e) {
+                    setSyncStatus("err", "⚠ オフライン（端末内に保存中）");
+                }
+            }
+
+            function getShareUrl() {
+                return `${location.origin}${location.pathname}?box=${encodeURIComponent(currentBox)}`;
+            }
+
+            function loadQrLib() {
+                if (window.QRCode) return Promise.resolve();
+                return new Promise((resolve, reject) => {
+                    const s = document.createElement("script");
+                    s.src = "https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js";
+                    s.onload = resolve;
+                    s.onerror = reject;
+                    document.head.appendChild(s);
+                });
+            }
+
+            window.openShareModal = async function() {
+                const url = getShareUrl();
+                document.getElementById("share-url").innerText = url;
+                const qr = document.getElementById("share-qr");
+                qr.innerHTML = "";
+                document.getElementById("share-overlay").style.display = "flex";
+                try {
+                    await loadQrLib();
+                    new QRCode(qr, { text: url, width: 200, height: 200 });
+                } catch (e) {
+                    qr.innerHTML = '<span style="color:#333; font-size:11px;">QRコードを表示できませんでした</span>';
+                }
+            }
+
+            window.closeShareModal = function() {
+                document.getElementById("share-overlay").style.display = "none";
+            }
+
+            window.copyShareUrl = function() {
+                navigator.clipboard.writeText(getShareUrl()).then(() => alert("URLをコピーしました！"));
             }
         </script>
         <script src="/trader-ui.js"></script>
