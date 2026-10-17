@@ -75,6 +75,7 @@
       try {
         const selected=await api('/select',{jan,master_id:product.master_id});
         if(own!==generation)return;
+        if(window.loadStock) window.loadStock();
         current=selected;
         const results=heading(selected);
         el('div',selected.storage==='google_sheets'?'Google Sheetsに紐づけを保存しました。次回のスキャンからこの商品を参照します。':'JANとの紐づけを保存しました。次回のスキャンからこの商品を参照します。',results);
@@ -98,6 +99,7 @@
         status.textContent=job.progress;
         if(job.status==='error')throw new Error(job.error);
         if(job.status==='done') {
+          if(job.linked && window.loadStock) window.loadStock();
           results.replaceChildren();
           if(!job.products.length) el('div','候補がありません。検索語を短くして再検索してください。',results);
           else if(!job.linked) el('div','同じ商品か、キャラクター・衣装・PLUS等の版・型番を確認して選んでください。',results);

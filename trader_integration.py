@@ -87,6 +87,35 @@ class TraderService:
                 'history':[json.loads(r['data']) for r in history],
                 'storage':'google_sheets' if self.sheet_store is not None else 'local'}
 
+    def quote_version(self):
+        with self.connect() as db:
+            return db.execute('SELECT COALESCE(MAX(id),0) FROM trader_history').fetchone()[0]
+
+    def stock_quotes(self, jans):
+        """Read saved quotes only; never search or refresh the remote shop here."""
+        self.ensure_restored()
+        wanted=set(jans)
+        result={jan:{'status':'unlinked','price_yen':None} for jan in wanted}
+        with self.connect() as db:
+            rows=db.execute("""
+                SELECT l.jan,l.expected,l.inventory_title,i.title,p.data,p.updated
+                FROM trader_links l LEFT JOIN items i ON i.jan=l.jan
+                LEFT JOIN trader_products p ON p.master_id=l.master_id
+            """).fetchall()
+        for row in rows:
+            if row['jan'] not in wanted: continue
+            product=json.loads(row['data']) if row['data'] else {}
+            expected=json.loads(row['expected'])
+            valid=normalize(row['title'] or '')==normalize(row['inventory_title']) and all(
+                normalize(product.get('observed',{}).get(k,''))==normalize(expected.get(k,''))
+                for k in ('model','name'))
+            price=product.get('price_yen')
+            ok=valid and product.get('status')=='ok' and type(price) is int and price>=0
+            result[row['jan']]={'status':'ok' if ok else 'needs_review',
+                'price_yen':price if ok else None,'checked_at':product.get('checked_at',''),
+                'stale':time.time()-(row['updated'] or 0)>TTL}
+        return result
+
     def event(self,kind,jan,expected,title,linked_at,product):
         return {'schema':1,'event_id':uuid.uuid4().hex,'kind':kind,'jan':jan,
                 'recorded_at':now(),'expected':expected,'inventory_title':title,
