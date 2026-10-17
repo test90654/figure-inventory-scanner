@@ -1302,6 +1302,26 @@ def get_scanner_page():
             .btn-stock-export { background: #f1c40f; color: #000; }
             .btn-stock-csv { background: #555; color: #fff; }
             body.mode-stock .result-banner { background: #3a3110; border-color: #f1c40f; color: #fff3cd; }
+
+            /* ===== PC表示: 2カラム + 全体を拡大（スマホ表示は変更なし） ===== */
+            @media (min-width: 900px) {
+                body { zoom: 1.1; padding: 16px 20px; }
+                .layout { display: grid; grid-template-columns: minmax(300px, 340px) minmax(0, 680px); justify-content: center; align-items: start; gap: 24px; }
+                .col-main { position: sticky; top: 12px; }
+                .layout #reader-container, .layout .manual-input-box, .layout .search-box, .layout .result-banner,
+                .layout .list-section, .layout .mode-tabs, .layout .location-box, .layout .btn-toggle { max-width: none; }
+                .layout .list-section { margin-top: 0; }
+                #search-results { max-height: 45vh; }
+                .result-banner #res-title { max-width: 260px !important; }
+                .modal-content { max-width: 420px; }
+            }
+            @media (min-width: 1200px) {
+                body { zoom: 1.2; }
+                .layout { grid-template-columns: minmax(340px, 400px) minmax(0, 680px); }
+            }
+            @media (min-width: 1400px) {
+                body { zoom: 1.35; }
+            }
         </style>
     </head>
     <body>
@@ -1324,6 +1344,8 @@ def get_scanner_page():
                 </div>
             </div>
         </div>
+        <div class="layout">
+        <div class="col-main">
         <p>カメラにかざすか、バーコードを手打ち入力</p>
 
         <div class="mode-tabs">
@@ -1366,6 +1388,8 @@ def get_scanner_page():
             </div>
         </div>
         <div id="error-msg" class="error"></div>
+        </div>
+        <div class="col-list">
 
         <div id="stock-section" class="list-section" style="display:none;">
             <div class="summary-box">
@@ -1395,6 +1419,8 @@ def get_scanner_page():
             <button class="btn btn-image" onclick="generatePreviewsServer()">🖼️ パッケージ写真プレビュー生成</button>
         </div>
         <div id="preview-container"></div>
+        </div>
+        </div>
 
         <!-- 手動登録・画像再登録・ファイルアップロードモーダル -->
         <div id="modal-overlay">
