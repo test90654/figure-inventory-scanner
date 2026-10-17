@@ -570,7 +570,14 @@ class StockDeleteRequest(BaseModel):
 
 @app.get("/api/stock")
 def get_stock():
-  return {"items": fetch_stock_rows()}
+  items = fetch_stock_rows()
+  try:
+    quotes = trader_service.stock_quotes(s["jan"] for s in items) if items else {}
+  except Exception:
+    quotes = {s["jan"]: {"status": "unavailable", "price_yen": None} for s in items}
+  for item in items:
+    item["trader_quote"] = quotes.get(item["jan"])
+  return {"items": items}
 
 
 @app.post("/api/stock/adjust")
@@ -761,6 +768,7 @@ def sync_state(box: str = "default"):
       "instance": SERVER_INSTANCE_ID,
       "cart_version": row[0] if row else 0,
       "stock_version": _stock_sync_gen,
+      "trader_version": trader_service.quote_version(),
   }
 
 
@@ -1240,6 +1248,13 @@ def get_scanner_page():
             .item-quote { font-size: 10px; color: #38bdf8; margin-top: 2px; }
             .item-quote a { color: #38bdf8; text-decoration: none; }
             
+            #stock-items .item-info { min-width: 0; overflow-wrap: anywhere; }
+            .stock-price { color: #ffcf79; font-size: 13px; margin-top: 4px; font-weight: bold; }
+            .stock-price small { color: #aaa; font-size: 10px; font-weight: normal; }
+            @media (max-width: 599px) {
+                #stock-items .item-row { display: grid; grid-template-columns: 36px minmax(0, 1fr); align-items: start; }
+                #stock-items .qty-control { grid-column: 2; flex-wrap: wrap; white-space: normal; }
+            }
             .qty-control { display: flex; align-items: center; white-space: nowrap; flex-shrink: 0; gap: 4px; }
             .qty-btn { background: #444; color: white; border: none; width: 24px; height: 24px; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 13px; display: flex; align-items: center; justify-content: center; }
             .qty-btn:active { background: #666; }
@@ -2213,6 +2228,16 @@ def get_scanner_page():
                 );
             }
 
+            function stockPriceHtml(quote) {
+                if (!quote) return '<div class="stock-price"><small>買取参考：未取得</small></div>';
+                if (quote.status !== "ok") {
+                    const label = quote.status === "unlinked" ? "未紐づけ" : quote.status === "unavailable" ? "取得できませんでした" : "要確認";
+                    return `<div class="stock-price"><small>買取参考：${label}</small></div>`;
+                }
+                const checked = quote.checked_at ? `確認 ${quote.checked_at.replace("T", " ").slice(0, 16)}` : "";
+                return `<div class="stock-price">買取参考 ¥${Number(quote.price_yen).toLocaleString("ja-JP")} <small>／個</small><br><small>${escapeHtml(checked)}${quote.stale ? " ・ 更新推奨" : ""}</small></div>`;
+            }
+
             window.renderStock = function() {
                 const container = document.getElementById("stock-items");
                 const items = getFilteredStock();
@@ -2239,6 +2264,7 @@ def get_scanner_page():
                             <div class="item-info">
                                 <div class="item-title">${escapeHtml(item.title)}</div>
                                 <div class="item-jan">コード: ${escapeHtml(item.jan)}</div>
+                                ${stockPriceHtml(item.trader_quote)}
                                 ${loc}
                             </div>
                             <div class="qty-control">
@@ -2422,6 +2448,7 @@ def get_scanner_page():
             let cartVersion = 0;
             let serverInstance = "";
             let stockVersion = null;
+            let traderVersion = null;
             let pendingCartOps = 0;
             let cartOpChain = Promise.resolve();
             let cartDirty = false; // 送信に失敗した変更が端末内に残っている
@@ -2530,10 +2557,11 @@ def get_scanner_page():
                         setSyncStatus("ok", "☁ 同期済み");
                     }
 
-                    if (stockVersion !== null && st.stock_version !== stockVersion && currentMode === "stock") {
+                    if (currentMode === "stock" && ((stockVersion !== null && st.stock_version !== stockVersion) || (traderVersion !== null && st.trader_version !== traderVersion))) {
                         loadStock();
                     }
                     stockVersion = st.stock_version;
+                    traderVersion = st.trader_version;
                 } catch (e) {
                     setSyncStatus("err", "⚠ オフライン（端末内に保存中）");
                 }
