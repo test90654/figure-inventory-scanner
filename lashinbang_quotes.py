@@ -17,6 +17,11 @@ from search_terms import search_query
 BASE = "https://shop.lashinbang.com"
 TTL = 6 * 3600
 ERROR_TTL = 5 * 60
+# 1件の取得がこれ以上終わらなければ作業スレッドが固まったとみなし、作り直して残りを続ける
+STUCK_AFTER = 120
+# 紐づけ(Google Sheets)の読み込みを他のスレッドが待つ上限
+LINK_LOAD_WAIT = 30
+_UNKNOWN = object()
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Referer": BASE + "/kaitori",
@@ -131,6 +136,9 @@ class LashinbangQuotes:
         self.link_store = None
         self.links_restored = False
         self.link_guard = threading.RLock()
+        self.link_load_guard = threading.Lock()
+        self.executor_gen = 0
+        self.active = None  # (executor_gen, jan, 開始時刻) 実行中の取得
         self.searches = {}
         with self.connect() as db:
             db.execute("CREATE TABLE IF NOT EXISTS lashinbang_quotes(jan TEXT PRIMARY KEY, data TEXT NOT NULL, retry_at REAL NOT NULL)")
@@ -145,7 +153,10 @@ class LashinbangQuotes:
     def ensure_links(self):
         if self.link_store is None or self.links_restored:
             return
-        with self.link_guard:
+        # Sheetsの読み込みは link_guard の外で行い、他の処理を巻き込んで止めない
+        if not self.link_load_guard.acquire(timeout=LINK_LOAD_WAIT):
+            raise TimeoutError("らしんばん紐づけの読み込みが終わっていません")
+        try:
             if self.links_restored:
                 return
             links = self.link_store.load()
@@ -153,12 +164,21 @@ class LashinbangQuotes:
                 for code, link in links.items():
                     db.execute("INSERT OR REPLACE INTO lashinbang_links VALUES(?,?)", (code, json.dumps(link, ensure_ascii=False)))
             self.links_restored = True
+        finally:
+            self.link_load_guard.release()
 
     def link(self, code):
         self.ensure_links()
+        return self.local_link(code)
+
+    def local_link(self, code):
         with self.connect() as db:
             row = db.execute("SELECT data FROM lashinbang_links WHERE code=?", (code,)).fetchone()
         return json.loads(row[0]) if row else None
+
+    @staticmethod
+    def link_signature(link):
+        return (link.get("master_id"), link.get("linked_at")) if link else None
 
     def inventory_title(self, code):
         with self.connect() as db:
@@ -222,6 +242,8 @@ class LashinbangQuotes:
         return (json.loads(row[0]), row[1]) if row else (None, 0)
 
     def get_many(self, jans):
+        # 先に固まりを解消しておく（中断した商品が同じ一覧取得の中ですぐ再投入されないように）
+        self.recover_if_stuck()
         wanted = set(jans)
         if wanted:
             self.ensure_links()
@@ -245,6 +267,7 @@ class LashinbangQuotes:
         return result
 
     def schedule(self, jan, force=False, cached_retry_at=None):
+        self.recover_if_stuck()
         if not supported_jan(jan) and not self.link(jan):
             return False
         retry_at = self.cached(jan)[1] if cached_retry_at is None else cached_retry_at
@@ -254,50 +277,91 @@ class LashinbangQuotes:
             if jan in self.pending:
                 return False
             self.pending.add(jan)
+            executor, gen = self.executor, self.executor_gen
         try:
-            self.executor.submit(self.refresh, jan)
+            executor.submit(self.refresh, jan, gen)
         except Exception:
             with self.guard:
                 self.pending.discard(jan)
             raise
         return True
 
-    def refresh(self, jan):
+    def recover_if_stuck(self):
+        """取得が STUCK_AFTER 秒以上終わらない時、作業スレッドを作り直して残りの取得を続ける"""
+        with self.guard:
+            active = self.active
+            if (not active or active[0] != self.executor_gen
+                    or time.monotonic() - active[2] < STUCK_AFTER):
+                return False
+            old = self.executor
+            self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lashinbang")
+            self.executor_gen += 1
+            self.active = None
+            # 待ち行列ごと捨てる。次の一覧取得で未取得分が新しいスレッドへ入れ直される
+            self.pending.clear()
+        jan = active[1]
+        logging.getLogger(__name__).warning(
+            "Lashinbang lookup for %s did not finish in %ss; restarting worker", jan, STUCK_AFTER)
+        old.shutdown(wait=False, cancel_futures=True)
+        # 固まった商品はすぐに再投入せず、通常の失敗と同じく少し待ってから再取得する
+        old_quote, _ = self.cached(jan)
+        quote = ({**old_quote, "stale": True, "refresh_error": True} if old_quote
+                 else {"status": "error", "price_yen": None})
+        quote["error_message"] = "応答がないため取得を中断しました"
         with self.link_guard:
-            self._refresh(jan)
-
-    def _refresh(self, jan):
-        try:
-            time.sleep(max(0, self.next_request - time.monotonic()))
-            try:
-                # Serialize publication with selection so an older queued fetch cannot
-                # overwrite the price of a newly selected product.
-                with self.link_guard:
-                    link = self.link(jan)
-                    quote = self.linked_quote(link) if link else self.lookup(jan)
-                quote["checked_at"] = dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).isoformat(timespec="seconds")
-                quote["stale"] = False
-                retry_at = time.time() + TTL
-            except Exception as exc:
-                logging.getLogger(__name__).exception("Lashinbang buyback lookup failed")
-                old, _ = self.cached(jan)
-                quote = {**old, "stale": True, "refresh_error": True} if old else {"status": "error", "price_yen": None}
-                if isinstance(exc, requests.HTTPError) and exc.response is not None:
-                    message = f"接続先がHTTP {exc.response.status_code}を返しました"
-                elif isinstance(exc, requests.Timeout):
-                    message = "接続がタイムアウトしました"
-                elif isinstance(exc, requests.ConnectionError):
-                    message = "接続できませんでした"
-                elif isinstance(exc, (ValueError, KeyError, TypeError)):
-                    message = "検索データを読み取れませんでした"
-                else:
-                    message = "価格を取得できませんでした"
-                quote["error_message"] = message
-                retry_at = time.time() + ERROR_TTL
             with self.connect() as db:
-                db.execute("INSERT OR REPLACE INTO lashinbang_quotes VALUES(?,?,?)", (jan, json.dumps(quote, ensure_ascii=False), retry_at))
+                db.execute("INSERT OR REPLACE INTO lashinbang_quotes VALUES(?,?,?)",
+                           (jan, json.dumps(quote, ensure_ascii=False), time.time() + ERROR_TTL))
+        with self.guard:
+            self.version += 1
+        return True
+
+    def refresh(self, jan, gen=None):
+        with self.guard:
+            gen = self.executor_gen if gen is None else gen
+            self.active = (gen, jan, time.monotonic())
+        try:
+            self._refresh(jan)
         finally:
             self.next_request = time.monotonic() + 1
             with self.guard:
-                self.pending.discard(jan)
+                if self.active and self.active[0] == gen:
+                    self.active = None
+                # 作り直し前の古いスレッドが後から終わっても、新しい待ち行列は乱さない
+                if gen == self.executor_gen:
+                    self.pending.discard(jan)
                 self.version += 1
+
+    def _refresh(self, jan):
+        time.sleep(max(0, self.next_request - time.monotonic()))
+        before = _UNKNOWN
+        try:
+            # 通信はロックの外で行う（Sheetsや相手サイトが固まっても紐づけ操作を止めない）
+            link = self.link(jan)
+            before = self.link_signature(link)
+            quote = self.linked_quote(link) if link else self.lookup(jan)
+            quote["checked_at"] = dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).isoformat(timespec="seconds")
+            quote["stale"] = False
+            retry_at = time.time() + TTL
+        except Exception as exc:
+            logging.getLogger(__name__).exception("Lashinbang buyback lookup failed")
+            old, _ = self.cached(jan)
+            quote = {**old, "stale": True, "refresh_error": True} if old else {"status": "error", "price_yen": None}
+            if isinstance(exc, requests.HTTPError) and exc.response is not None:
+                message = f"接続先がHTTP {exc.response.status_code}を返しました"
+            elif isinstance(exc, requests.Timeout):
+                message = "接続がタイムアウトしました"
+            elif isinstance(exc, requests.ConnectionError):
+                message = "接続できませんでした"
+            elif isinstance(exc, (ValueError, KeyError, TypeError)):
+                message = "検索データを読み取れませんでした"
+            else:
+                message = "価格を取得できませんでした"
+            quote["error_message"] = message
+            retry_at = time.time() + ERROR_TTL
+        # 保存だけを select() と排他にし、取得中に紐づけ直された場合は古い結果を捨てる
+        with self.link_guard:
+            if before is not _UNKNOWN and self.link_signature(self.local_link(jan)) != before:
+                return
+            with self.connect() as db:
+                db.execute("INSERT OR REPLACE INTO lashinbang_quotes VALUES(?,?,?)", (jan, json.dumps(quote, ensure_ascii=False), retry_at))
