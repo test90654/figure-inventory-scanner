@@ -130,6 +130,74 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(self.service.version, 1)
         self.assertEqual(self.service.get_many([JAN])[JAN]["status"], 'not_found')
 
+    def test_hung_lookup_does_not_stall_remaining_items(self):
+        # 1件が応答しないまま固まっても、残りの商品の取得は続く
+        other = "4983164873351"
+        hang = threading.Event()
+        def lookup(jan):
+            if jan == JAN:
+                hang.wait(timeout=5)
+                return {"status": "ok", "price_yen": 1}
+            return {"status": "ok", "price_yen": 700}
+        self.service.lookup = lookup
+        stuck_executor = self.service.executor
+        try:
+            with patch('lashinbang_quotes.STUCK_AFTER', 0.2):
+                self.service.schedule(JAN)
+                threading.Event().wait(0.4)  # time.sleep は setUp でモック済み
+                with self.assertLogs('lashinbang_quotes', level='WARNING'):
+                    self.service.get_many([JAN, other])
+                for _ in range(50):
+                    if self.service.get_many([other])[other].get("price_yen") == 700:
+                        break
+                    threading.Event().wait(0.1)
+            self.assertEqual(self.service.get_many([other])[other]["price_yen"], 700)
+            stuck = self.service.get_many([JAN])[JAN]
+            self.assertEqual(stuck["status"], "error")
+            self.assertFalse(stuck["pending"])
+        finally:
+            hang.set()
+            stuck_executor.shutdown(wait=True)
+
+    def test_network_lookup_runs_without_holding_link_lock(self):
+        # 価格取得の通信中も、紐づけ操作（select）がロック待ちで止まらない
+        started, finish = threading.Event(), threading.Event()
+        def lookup(jan):
+            started.set()
+            finish.wait(timeout=3)
+            return {"status": "ok", "price_yen": 500}
+        self.service.lookup = lookup
+        try:
+            self.service.schedule(JAN)
+            self.assertTrue(started.wait(timeout=3))
+            acquired = []
+            def probe():
+                ok = self.service.link_guard.acquire(timeout=1)
+                acquired.append(ok)
+                if ok:
+                    self.service.link_guard.release()
+            thread = threading.Thread(target=probe)
+            thread.start(); thread.join()
+            self.assertEqual(acquired, [True])
+        finally:
+            finish.set()
+
+    def test_result_fetched_before_relink_does_not_overwrite_new_link(self):
+        old_link = {'code': JAN, 'master_id': '1', 'linked_at': 'a', 'inventory_title': 'X', 'title': 'X'}
+        new_link = {**old_link, 'master_id': '2', 'linked_at': 'b'}
+        new_quote = {"status": "ok", "price_yen": 900, "linked": True}
+        with self.service.connect() as db:
+            db.execute('INSERT INTO lashinbang_links VALUES(?,?)', (JAN, json.dumps(old_link)))
+        def linked_quote(link):
+            # 取得中にユーザーが別商品へ紐づけ直した
+            with self.service.connect() as db:
+                db.execute('INSERT OR REPLACE INTO lashinbang_links VALUES(?,?)', (JAN, json.dumps(new_link)))
+                db.execute('INSERT OR REPLACE INTO lashinbang_quotes VALUES(?,?,?)', (JAN, json.dumps(new_quote), time.time()+999))
+            return {"status": "ok", "price_yen": 100, "linked": True}
+        with patch.object(self.service, 'linked_quote', side_effect=linked_quote):
+            self.service.refresh(JAN)
+        self.assertEqual(self.service.cached(JAN)[0]["price_yen"], 900)
+
     def test_expired_quote_schedules_refresh_and_is_marked_stale(self):
         old = {"status": "ok", "price_yen": 500, "checked_at": "2026-10-16T12:00:00+09:00"}
         with self.service.connect() as db:

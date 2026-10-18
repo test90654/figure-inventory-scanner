@@ -210,6 +210,8 @@ def get_spreadsheet():
       credential_path, scope
   )
   client = gspread.authorize(creds)
+  # 既定では応答が無いと無期限に待ち、価格取得などの処理ごと止まるため上限を設ける
+  client.set_timeout(30)
   SPREADSHEET_ID = "1CHnUUP_9uiZYaWzbpoaTIjYwyFY5YBAv4x5M3gka2T0"
   return client.open_by_key(SPREADSHEET_ID)
 
@@ -837,6 +839,11 @@ def cart_op(req: CartOpRequest):
 @app.get("/api/sync_state")
 def sync_state(box: str = "default"):
   """端末が数秒おきに呼ぶ軽量エンドポイント。変化があった時だけ本体を取りに行く"""
+  # らしんばんの取得が固まっていたら作り直す（固まると版数が動かず一覧の再取得も起きないため）
+  try:
+    lashinbang_quotes.recover_if_stuck()
+  except Exception:
+    traceback.print_exc()
   conn = sqlite3.connect(db_path)
   cursor = conn.cursor()
   cursor.execute("SELECT version FROM carts WHERE box = ?", (box,))
@@ -1596,6 +1603,17 @@ def get_scanner_page():
                 return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
             }
 
+            // 応答が返らない通信で画面の更新確認が止まらないよう、制限時間を付けて呼ぶ
+            async function fetchWithTimeout(url, options = {}, ms = 20000) {
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), ms);
+                try {
+                    return await fetch(url, Object.assign({}, options, { signal: controller.signal }));
+                } finally {
+                    clearTimeout(timer);
+                }
+            }
+
             function lsGet(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
             function lsSet(key, val) { try { localStorage.setItem(key, val); } catch (e) {} }
 
@@ -2201,9 +2219,18 @@ def get_scanner_page():
                 return stockItems.find(s => s.jan === jan && s.location === location);
             }
 
+            let stockLoading = false;
+            let stockReloadQueued = false;
+
             window.loadStock = async function() {
+                // 読み込み中に呼ばれたら重ねて投げず、終わった後に1回だけ読み直す
+                if (stockLoading) {
+                    stockReloadQueued = true;
+                    return;
+                }
+                stockLoading = true;
                 try {
-                    const res = await fetch('/api/stock');
+                    const res = await fetchWithTimeout('/api/stock');
                     if (!res.ok) throw new Error("HTTP " + res.status);
                     const data = await res.json();
                     stockItems = data.items || [];
@@ -2211,6 +2238,12 @@ def get_scanner_page():
                     renderStock();
                 } catch (e) {
                     document.getElementById("stock-items").innerHTML = `<p style="color:#ff6b6b; text-align:center;">在庫の読み込みに失敗しました: ${escapeHtml(e.message)}</p>`;
+                } finally {
+                    stockLoading = false;
+                    if (stockReloadQueued) {
+                        stockReloadQueued = false;
+                        loadStock();
+                    }
                 }
             }
 
@@ -2319,11 +2352,12 @@ def get_scanner_page():
             }
 
             function stockPriceTotals(items, field) {
-                const result = {amount: 0, counted: 0, excluded: 0, stale: 0};
+                const result = {amount: 0, counted: 0, excluded: 0, stale: 0, pending: 0};
                 for (const item of items) {
                     const quantity = Number(item.count);
                     if (!Number.isSafeInteger(quantity) || quantity <= 0) continue;
                     const quote = item[field];
+                    if (quote && (quote.pending || quote.status === "pending")) result.pending += quantity;
                     if (!quote || quote.status !== "ok" || !Number.isSafeInteger(quote.price_yen) || quote.price_yen < 0) {
                         result.excluded += quantity;
                         continue;
@@ -2341,7 +2375,7 @@ def get_scanner_page():
                 for (const [field, store] of [["trader_quote", "トレーダー"], ["lashinbang_quote", "らしんばん"]]) {
                     const sum = stockPriceTotals(items, field);
                     const amount = sum.counted || !sum.excluded ? yen(sum.amount) : "未集計";
-                    html += `<div>${store} <strong>${amount}</strong><br><small>集計 ${sum.counted}点 / 未集計 ${sum.excluded}点${sum.stale ? ` ・ 更新推奨 ${sum.stale}点` : ""}</small></div>`;
+                    html += `<div>${store} <strong>${amount}</strong><br><small>集計 ${sum.counted}点 / 未集計 ${sum.excluded}点${sum.pending ? ` ・ 取得中 ${sum.pending}点` : ""}${sum.stale ? ` ・ 更新推奨 ${sum.stale}点` : ""}</small></div>`;
                 }
                 return html;
             }
@@ -2638,7 +2672,7 @@ def get_scanner_page():
             }
 
             async function postCartOp(op) {
-                const res = await fetch('/api/cart/op', {
+                const res = await fetchWithTimeout('/api/cart/op', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(Object.assign({ box: currentBox }, op))
@@ -2693,10 +2727,13 @@ def get_scanner_page():
                 document.addEventListener("visibilitychange", () => { if (!document.hidden) pollSync(); });
             }
 
+            let pollInFlight = false;
+
             async function pollSync() {
-                if (document.hidden || pendingCartOps > 0) return;
+                if (document.hidden || pendingCartOps > 0 || pollInFlight) return;
+                pollInFlight = true;
                 try {
-                    const res = await fetch(`/api/sync_state?box=${encodeURIComponent(currentBox)}`);
+                    const res = await fetchWithTimeout(`/api/sync_state?box=${encodeURIComponent(currentBox)}`, {}, 10000);
                     if (!res.ok) throw new Error("HTTP " + res.status);
                     const st = await res.json();
 
@@ -2706,7 +2743,7 @@ def get_scanner_page():
                         // サーバーが再起動してリストが消えた → この端末の控えから復元
                         queueCartOp({ op: "replace", items: cart });
                     } else if (st.cart_version !== cartVersion || st.instance !== serverInstance) {
-                        const r = await fetch(`/api/cart?box=${encodeURIComponent(currentBox)}`);
+                        const r = await fetchWithTimeout(`/api/cart?box=${encodeURIComponent(currentBox)}`);
                         if (r.ok && pendingCartOps === 0) applyServerCart(await r.json());
                     } else {
                         setSyncStatus("ok", "☁ 同期済み");
@@ -2720,6 +2757,8 @@ def get_scanner_page():
                     lashinbangVersion = st.lashinbang_version;
                 } catch (e) {
                     setSyncStatus("err", "⚠ オフライン（端末内に保存中）");
+                } finally {
+                    pollInFlight = false;
                 }
             }
 
