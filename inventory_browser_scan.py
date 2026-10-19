@@ -1370,6 +1370,8 @@ def get_scanner_page():
             .lashinbang-actions button { background: #333; color: #eee; border: 1px solid #777; border-radius: 3px; font-size: 10px; cursor: pointer; }
             .lashinbang-actions button:disabled { opacity: .5; cursor: wait; }
             .stock-price small { color: #aaa; font-size: 10px; font-weight: normal; }
+            .trader-price-img { display: block; height: 28px; width: auto; max-width: 100%; background: #fff; border-radius: 3px; margin: 3px 0; }
+            .btn-confirm-price { background: #284b6c; color: #fff; border: 1px solid #78b9ff; border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer; }
             @media (max-width: 899px) {
                 #stock-items .item-row { display: grid; grid-template-columns: 36px minmax(0, 1fr); align-items: start; }
                 #stock-items .qty-control { grid-column: 2; flex-wrap: wrap; white-space: normal; }
@@ -2491,10 +2493,33 @@ def get_scanner_page():
                 }
                 if (quote.status !== "ok") {
                     const labels = {unlinked:"未紐づけ", unavailable:"取得できませんでした", needs_review:"要確認", pending:"取得中", not_found:"買取掲載なし", unsupported:"商品名で検索してください", error:"取得失敗"};
-                    return `<div class="stock-price"><small>${prefix}：${labels[quote.status] || "要確認"}${checking}${quote.error_message ? `（${escapeHtml(quote.error_message)}）` : ""}</small></div>`;
+                    // 価格画像を自動で読み取れなかった時は、画像を見せて金額を手入力できるようにする
+                    const review = quote.price_image_url && quote.jan
+                        ? `<br><small>画像の金額を確認してください</small><img class="trader-price-img" src="${escapeHtml(quote.price_image_url)}" alt="トレーダーの価格画像"><button type="button" class="btn-confirm-price" onclick="confirmTraderPrice('${escapeHtml(quote.jan)}')">金額を入力</button>`
+                        : "";
+                    return `<div class="stock-price"><small>${prefix}：${labels[quote.status] || "要確認"}${checking}${quote.error_message ? `（${escapeHtml(quote.error_message)}）` : ""}</small>${review}</div>`;
                 }
                 const subtotal = quantity > 1 ? `<br><small>${quantity}点 小計 ¥${(quote.price_yen * quantity).toLocaleString("ja-JP")}</small>` : "";
-                return `<div class="stock-price">${prefix} ¥${Number(quote.price_yen).toLocaleString("ja-JP")} <small>／個</small>${subtotal}<br><small>${escapeHtml(checked)}${quote.stale ? " ・ 更新推奨" : ""}${checking}${quote.refresh_error ? " ・ 更新失敗（前回値）" : ""}</small></div>`;
+                const manual = quote.price_source === "manual" ? " ・ 手入力" : "";
+                return `<div class="stock-price">${prefix} ¥${Number(quote.price_yen).toLocaleString("ja-JP")} <small>／個</small>${subtotal}<br><small>${escapeHtml(checked)}${manual}${quote.stale ? " ・ 更新推奨" : ""}${checking}${quote.refresh_error ? " ・ 更新失敗（前回値）" : ""}</small></div>`;
+            }
+
+            window.confirmTraderPrice = async function(jan) {
+                const input = prompt("トレーダーの価格画像に書かれている金額を入力してください（円・数字のみ）");
+                if (input === null) return;
+                const price = Number(String(input).normalize("NFKC").replace(/[,，円\s]/g, ""));
+                if (!Number.isSafeInteger(price) || price < 0) return alert("数字で入力してください");
+                try {
+                    const res = await fetchWithTimeout('/api/trader/confirm', {
+                        method: 'POST', headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ jan, price_yen: price })
+                    });
+                    const data = await res.json().catch(() => ({}));
+                    if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : "保存できませんでした");
+                    if (currentMode === "stock") await loadStock(); else await loadCartQuotes();
+                } catch (e) {
+                    alert("エラー: " + e.message);
+                }
             }
 
             window.refreshLashinbang = async function(jan) {

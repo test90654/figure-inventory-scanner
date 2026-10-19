@@ -24,6 +24,11 @@ TTL=6*60*60
 def now():
     return dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).isoformat(timespec='seconds')
 
+def image_digest(path):
+    """価格画像の同一判定用。ファイル形式の違いに左右されないよう、絵の中身（画素）から求める"""
+    with Image.open(path) as image:
+        return hashlib.sha256(repr(image.size).encode()+image.convert('RGB').tobytes()).hexdigest()
+
 def suggest_query(title):
     return search_query(title)
 
@@ -32,6 +37,10 @@ class StartRequest(BaseModel):
     query: str | None = Field(default=None,min_length=1,max_length=100)
     refresh: bool = False
     search: bool = False
+
+class ConfirmRequest(BaseModel):
+    jan: str = Field(min_length=1,max_length=32,pattern=r'^\d+$')
+    price_yen: int
 
 class SelectRequest(BaseModel):
     jan: str = Field(min_length=1,max_length=32,pattern=r'^\d+$')
@@ -110,9 +119,15 @@ class TraderService:
                 for k in ('model','name'))
             price=product.get('price_yen')
             ok=valid and product.get('status')=='ok' and type(price) is int and price>=0
-            result[row['jan']]={'status':'ok' if ok else 'needs_review',
+            quote={'status':'ok' if ok else 'needs_review','jan':row['jan'],
                 'price_yen':price if ok else None,'checked_at':product.get('checked_at',''),
                 'stale':time.time()-(row['updated'] or 0)>TTL}
+            if ok and product.get('price_source'):
+                quote['price_source']=product['price_source']
+            if not ok and valid and product.get('image_url'):
+                # 商品の同一性は確認済みで、価格画像だけ読み取れなかった → 画像を見て手入力できる
+                quote['price_image_url']=product['image_url']
+            result[row['jan']]=quote
         return result
 
     def event(self,kind,jan,expected,title,linked_at,product):
@@ -164,6 +179,37 @@ class TraderService:
                 self.record_history(db,jan,product)
                 db.execute('INSERT OR IGNORE INTO trader_synced_events VALUES(?)',(event['event_id'],))
         return self.state(jan)
+
+    def confirm_price(self,jan,price):
+        """価格画像を読み取れなかった商品に、画像を見た人が金額を入力して確定する"""
+        if type(price) is not int or not 0<=price<=10_000_000:
+            raise HTTPException(400,'金額は0〜10,000,000円で入力してください')
+        self.ensure_restored()
+        with self.persistence_lock:
+            with self.connect() as db:
+                row=db.execute('SELECT * FROM trader_links WHERE jan=?',(jan,)).fetchone()
+            if row is None: raise HTTPException(404,'先にトレーダーの商品を紐づけてください')
+            if normalize(self.item(jan))!=normalize(row['inventory_title']):
+                raise HTTPException(409,'登録商品名が変わったため、候補を選び直してください')
+            product,updated=self.product(row['master_id'])
+            expected=json.loads(row['expected'])
+            if not product or any(normalize(product.get('observed',{}).get(k,''))!=normalize(expected.get(k,'')) for k in ('model','name')):
+                raise HTTPException(409,'保存した型番・商品名と異なります。候補を再検索してください')
+            filename=(product.get('image_url') or '').removeprefix('/api/trader/image/')
+            path=self.data_dir/filename
+            if not re.fullmatch(r'\d+-[0-9a-f]{32}\.png',filename) or not path.is_file():
+                raise HTTPException(409,'価格画像がありません。価格を更新してから入力してください')
+            confirmed={**product,'status':'ok','price_yen':price,'price_source':'manual',
+                'manual_confirmed_at':now(),'image_sha256':image_digest(path)}
+            event=self.event('quote',jan,expected,row['inventory_title'],row['linked_at'],confirmed)
+            self.persist(event)  # Remote acknowledgement precedes local success.
+            with self.connect() as db:
+                # 確認しただけなので取得時刻（古さの判定）はそのまま
+                db.execute('INSERT OR REPLACE INTO trader_products VALUES(?,?,?)',
+                    (row['master_id'],json.dumps(confirmed,ensure_ascii=False),updated))
+                self.record_history(db,jan,confirmed)
+                db.execute('INSERT OR IGNORE INTO trader_synced_events VALUES(?)',(event['event_id'],))
+        return confirmed
 
     def accept_quote(self,jan,linked,current,previous,force):
         with self.persistence_lock:
@@ -234,12 +280,18 @@ class TraderService:
         with Image.open(io.BytesIO(raw)) as image: image.convert('RGB').save(image_path)
         record={'master_id':master,'observed':observed,'payload':candidate['payload'],
                 'checked_at':now(),'source_url':URL,'image_url':f'/api/trader/image/{image_name}',
-                'price_yen':None,'status':'needs_review','price_kind':'reference_buyback'}
+                'price_yen':None,'status':'needs_review','price_kind':'reference_buyback',
+                'image_sha256':image_digest(image_path)}
         try:
             result=read_price(image_path);record.update(result)
             if result['ocr_agreement']:
                 record.update(status='ok',price_yen=result['candidate_price_yen'])
         except Exception as exc: record['error']=str(exc)
+        if (record['status']!='ok' and cached and cached.get('price_source')=='manual'
+                and cached.get('image_sha256')==record['image_sha256'] and type(cached.get('price_yen')) is int):
+            # 価格画像が手入力した時と同じ＝価格は変わっていないので、手入力の金額を引き継ぐ
+            record.update(status='ok',price_yen=cached['price_yen'],price_source='manual',
+                          manual_confirmed_at=cached.get('manual_confirmed_at'))
         # Archive the detail that supplied this model, name and image.
         (self.data_dir/f'{master}-{stamp}.html').write_text(html,encoding='utf-8')
         with self.connect() as db:
@@ -306,6 +358,8 @@ def build_router(service):
     def start(request: StartRequest): return service.start(request)
     @router.get('/jobs/{token}')
     def job(token: str): return service.job(token)
+    @router.post('/confirm')
+    def confirm(request: ConfirmRequest): return service.confirm_price(request.jan,request.price_yen)
     @router.post('/select')
     def choose(request: SelectRequest): return service.choose(request.jan,request.master_id)
     @router.get('/image/{filename}')

@@ -65,20 +65,32 @@ def read_price(image_path):
     if len(groups)<2:
         raise ValueError('Could not separate the currency glyph')
     end=groups[-1][0]-2
+    # 数字は1文字ずつ離れて描かれているので、塊の数（最後の「円」を除く）が桁数になる
+    digit_count=len(groups)-1
+    # (前処理, 拡大率) 最初の2回で決まらない時だけ残りも試す
+    passes=((0,1),(1,4),(0,3),(1,2))
     results=[]
     with tempfile.TemporaryDirectory(prefix='trader-') as temp:
-        for index,picture in enumerate((color,mono)):
-            picture=picture.crop((0,0,end,picture.height))
-            scale=1 if index==0 else 4
+        for number,(index,scale) in enumerate(passes):
+            picture=(color,mono)[index].crop((0,0,end,mono.height))
             picture=ImageOps.expand(picture.resize((picture.width*scale,picture.height*scale)),24,fill='white')
-            path=Path(temp)/f'{index}.png';picture.save(path)
+            path=Path(temp)/f'{number}.png';picture.save(path)
             result=subprocess.run([executable,str(path),'stdout','--psm','7','-l','eng',
                 '-c','tessedit_char_whitelist=0123456789'],capture_output=True,text=True,timeout=30)
             text=result.stdout.strip()
             if result.returncode: raise RuntimeError(result.stderr.strip())
-            results.append({'engine':'tesseract','preprocessing':('color','mask')[index],
+            results.append({'engine':'tesseract','preprocessing':('color','mask')[index],'scale':scale,
                 'text':text,'price':int(text) if re.fullmatch(r'[0-9]+',text) else None})
-    prices=[r['price'] for r in results]
-    agreed=prices[0] is not None and prices[0]==prices[1]
-    return {'candidate_price_yen':prices[0] if agreed else None,'ocr_agreement':agreed,
-            'ocr_reads':results,'crop_box':box}
+            if len(results)>=2:
+                price=agreed_price(results,digit_count)
+                if price is not None: break
+    price=agreed_price(results,digit_count)
+    return {'candidate_price_yen':price,'ocr_agreement':price is not None,
+            'ocr_reads':results,'crop_box':box,'digit_count':digit_count}
+
+def agreed_price(results,digit_count):
+    """桁数が画像と合う読み取りが2つ以上あり、すべて同じ値の時だけ確定する（食い違いは要確認のまま）"""
+    valid=[r['price'] for r in results if r['price'] is not None and len(r['text'])==digit_count]
+    if len(valid)>=2 and len(set(valid))==1:
+        return valid[0]
+    return None
