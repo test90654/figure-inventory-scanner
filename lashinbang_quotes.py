@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from urllib.parse import urlparse
@@ -139,6 +140,9 @@ class LashinbangQuotes:
         self.link_load_guard = threading.Lock()
         self.executor_gen = 0
         self.active = None  # (executor_gen, jan, 開始時刻) 実行中の取得
+        # 取得待ちの列。持込リストの商品は priority_queue に入れて先に取得する
+        self.queue = deque()
+        self.priority_queue = deque()
         self.searches = {}
         with self.connect() as db:
             db.execute("CREATE TABLE IF NOT EXISTS lashinbang_quotes(jan TEXT PRIMARY KEY, data TEXT NOT NULL, retry_at REAL NOT NULL)")
@@ -241,7 +245,7 @@ class LashinbangQuotes:
             row = db.execute("SELECT data,retry_at FROM lashinbang_quotes WHERE jan=?", (jan,)).fetchone()
         return (json.loads(row[0]), row[1]) if row else (None, 0)
 
-    def get_many(self, jans):
+    def get_many(self, jans, priority=False):
         # 先に固まりを解消しておく（中断した商品が同じ一覧取得の中ですぐ再投入されないように）
         self.recover_if_stuck()
         wanted = set(jans)
@@ -259,14 +263,14 @@ class LashinbangQuotes:
                 result[jan] = {"status": "unlinked", "price_yen": None}
                 continue
             quote, retry_at = cached.get(jan, (None, 0))
-            self.schedule(jan, cached_retry_at=retry_at)
+            self.schedule(jan, cached_retry_at=retry_at, priority=priority)
             with self.guard:
                 pending = jan in self.pending
             result[jan] = {**(quote or {"status": "pending", "price_yen": None}), "pending": pending, "linked": bool(link),
                            "stale": bool(quote and (quote.get("stale") or time.time() >= retry_at))}
         return result
 
-    def schedule(self, jan, force=False, cached_retry_at=None):
+    def schedule(self, jan, force=False, cached_retry_at=None, priority=False):
         self.recover_if_stuck()
         if not supported_jan(jan) and not self.link(jan):
             return False
@@ -275,16 +279,37 @@ class LashinbangQuotes:
             return False
         with self.guard:
             if jan in self.pending:
+                # 通常の列で待っている商品は優先の列へ移す（作業の数は変えない）
+                if priority and jan in self.queue:
+                    self.queue.remove(jan)
+                    self.priority_queue.append(jan)
                 return False
             self.pending.add(jan)
+            (self.priority_queue if priority else self.queue).append(jan)
             executor, gen = self.executor, self.executor_gen
         try:
-            executor.submit(self.refresh, jan, gen)
+            # 作業1つにつき列から1件取り出す。どの商品を取るかは実行時に決める
+            executor.submit(self.run_next, gen)
         except Exception:
             with self.guard:
                 self.pending.discard(jan)
+                for queue in (self.queue, self.priority_queue):
+                    if jan in queue:
+                        queue.remove(jan)
             raise
         return True
+
+    def run_next(self, gen):
+        with self.guard:
+            if gen != self.executor_gen:
+                return
+            if self.priority_queue:
+                jan = self.priority_queue.popleft()
+            elif self.queue:
+                jan = self.queue.popleft()
+            else:
+                return
+        self.refresh(jan, gen)
 
     def recover_if_stuck(self):
         """取得が STUCK_AFTER 秒以上終わらない時、作業スレッドを作り直して残りの取得を続ける"""
@@ -299,6 +324,8 @@ class LashinbangQuotes:
             self.active = None
             # 待ち行列ごと捨てる。次の一覧取得で未取得分が新しいスレッドへ入れ直される
             self.pending.clear()
+            self.queue.clear()
+            self.priority_queue.clear()
         jan = active[1]
         logging.getLogger(__name__).warning(
             "Lashinbang lookup for %s did not finish in %ss; restarting worker", jan, STUCK_AFTER)

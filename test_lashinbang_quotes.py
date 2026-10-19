@@ -159,6 +159,31 @@ class CacheTests(unittest.TestCase):
             hang.set()
             stuck_executor.shutdown(wait=True)
 
+    def test_priority_items_jump_ahead_of_queued_items(self):
+        # 持込リストの商品（優先）は、先に並んでいる保管在庫の商品より先に取得する
+        first, a, b, c = "4983164000001", "4983164000002", "4983164000003", "4983164000004"
+        started, release = threading.Event(), threading.Event()
+        order = []
+        def lookup(jan):
+            order.append(jan)
+            if jan == first:
+                started.set()
+                release.wait(timeout=3)
+            return {"status": "ok", "price_yen": 100}
+        self.service.lookup = lookup
+        try:
+            self.service.schedule(first)
+            self.assertTrue(started.wait(timeout=3))
+            self.service.schedule(a)
+            self.service.schedule(b)
+            self.service.schedule(c, priority=True)
+            # 既に通常の列にいる商品も、優先指定で前に移る（重複取得はしない）
+            self.service.schedule(b, priority=True)
+        finally:
+            release.set()
+            self.service.executor.shutdown(wait=True)
+        self.assertEqual(order, [first, c, b, a])
+
     def test_network_lookup_runs_without_holding_link_lock(self):
         # 価格取得の通信中も、紐づけ操作（select）がロック待ちで止まらない
         started, finish = threading.Event(), threading.Event()
