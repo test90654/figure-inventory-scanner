@@ -2542,11 +2542,35 @@ def get_scanner_page():
                     const review = quote.price_image_url && quote.jan
                         ? `<br><small>画像の金額を確認してください</small><img class="trader-price-img" src="${escapeHtml(quote.price_image_url)}" alt="トレーダーの価格画像"><button type="button" class="btn-confirm-price" onclick="confirmTraderPrice('${escapeHtml(quote.jan)}')">金額を入力</button>`
                         : "";
-                    return `<div class="stock-price"><small>${prefix}：${labels[quote.status] || "要確認"}${checking}${quote.error_message ? `（${escapeHtml(quote.error_message)}）` : ""}</small>${review}</div>`;
+                    const unlinkReview = label === "トレーダー" && quote.jan && quote.status === "needs_review"
+                        ? ` <button type="button" class="btn-confirm-price" onclick="unlinkTrader('${escapeHtml(quote.jan)}')">紐づけ解除</button>` : "";
+                    return `<div class="stock-price"><small>${prefix}：${labels[quote.status] || "要確認"}${checking}${quote.error_message ? `（${escapeHtml(quote.error_message)}）` : ""}</small>${review}${unlinkReview}</div>`;
                 }
                 const subtotal = quantity > 1 ? `<br><small>${quantity}点 小計 ¥${(quote.price_yen * quantity).toLocaleString("ja-JP")}</small>` : "";
                 const manual = quote.price_source === "manual" ? " ・ 手入力" : "";
-                return `<div class="stock-price">${prefix} ¥${Number(quote.price_yen).toLocaleString("ja-JP")} <small>／個</small>${subtotal}<br><small>${escapeHtml(checked)}${manual}${quote.stale ? " ・ 更新推奨" : ""}${checking}${quote.refresh_error ? " ・ 更新失敗（前回値）" : ""}</small></div>`;
+                const unlink = label === "トレーダー" && quote.jan
+                    ? ` <button type="button" class="btn-confirm-price" onclick="unlinkTrader('${escapeHtml(quote.jan)}')">紐づけ解除</button>` : "";
+                return `<div class="stock-price">${prefix} ¥${Number(quote.price_yen).toLocaleString("ja-JP")} <small>／個</small>${subtotal}<br><small>${escapeHtml(checked)}${manual}${quote.stale ? " ・ 更新推奨" : ""}${checking}${quote.refresh_error ? " ・ 更新失敗（前回値）" : ""}</small>${unlink}</div>`;
+            }
+
+            // 価格の表示をすぐ取り直す（トレーダーのパネルからも呼ぶ）
+            window.reloadPriceViews = function() {
+                if (currentMode === "stock") loadStock(); else loadCartQuotes();
+            }
+
+            window.unlinkTrader = async function(jan) {
+                if (!confirm("このトレーダー商品との紐づけを解除しますか？（間違えて選んだ時に使います）")) return;
+                try {
+                    const res = await fetchWithTimeout('/api/trader/unlink', {
+                        method: 'POST', headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ jan })
+                    });
+                    const data = await res.json().catch(() => ({}));
+                    if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : "解除できませんでした");
+                    reloadPriceViews();
+                } catch (e) {
+                    alert("エラー: " + e.message);
+                }
             }
 
             window.confirmTraderPrice = async function(jan) {

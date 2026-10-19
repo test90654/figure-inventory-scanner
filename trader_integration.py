@@ -42,6 +42,9 @@ class ConfirmRequest(BaseModel):
     jan: str = Field(min_length=1,max_length=32,pattern=r'^\d+$')
     price_yen: int
 
+class UnlinkRequest(BaseModel):
+    jan: str = Field(min_length=1,max_length=32,pattern=r'^\d+$')
+
 class SelectRequest(BaseModel):
     jan: str = Field(min_length=1,max_length=32,pattern=r'^\d+$')
     master_id: str = Field(min_length=1,max_length=32,pattern=r'^\d+$')
@@ -146,6 +149,12 @@ class TraderService:
                         if db.execute('SELECT 1 FROM trader_synced_events WHERE event_id=?',(event['event_id'],)).fetchone():continue
                         product=event['product'];jan=event['jan'];master=product['master_id']
                         current=db.execute('SELECT master_id,expected FROM trader_links WHERE jan=?',(jan,)).fetchone()
+                        if event['kind']=='unlink':
+                            if current and current['master_id']==master:
+                                db.execute('DELETE FROM trader_links WHERE jan=?',(jan,))
+                            self.record_history(db,jan,product)
+                            db.execute('INSERT INTO trader_synced_events VALUES(?)',(event['event_id'],))
+                            continue
                         accepted=event['kind']=='select' or (current and current['master_id']==master and json.loads(current['expected'])==event['expected'])
                         if event['kind']=='select':
                             db.execute('INSERT OR REPLACE INTO trader_links VALUES(?,?,?,?,?)',
@@ -210,6 +219,26 @@ class TraderService:
                 self.record_history(db,jan,confirmed)
                 db.execute('INSERT OR IGNORE INTO trader_synced_events VALUES(?)',(event['event_id'],))
         return confirmed
+
+    def unlink(self,jan):
+        """間違えて紐づけた商品を外す。解除も記録として残し、再起動後の復元でも外れたままにする"""
+        self.ensure_restored()
+        with self.persistence_lock:
+            with self.connect() as db:
+                row=db.execute('SELECT * FROM trader_links WHERE jan=?',(jan,)).fetchone()
+            if row is None: raise HTTPException(404,'この商品はトレーダーに紐づけられていません')
+            product,_=self.product(row['master_id'])
+            # 解除の記録に価格画像は不要（画像が無くても解除できるように外す）
+            snapshot={k:v for k,v in (product or {}).items() if k not in ('image_url','payload','image_source')}
+            snapshot.update(master_id=row['master_id'],checked_at=now(),status='unlinked',price_yen=None)
+            snapshot.setdefault('observed',json.loads(row['expected']))
+            event=self.event('unlink',jan,json.loads(row['expected']),row['inventory_title'],row['linked_at'],snapshot)
+            self.persist(event)  # Remote acknowledgement precedes local success.
+            with self.connect() as db:
+                db.execute('DELETE FROM trader_links WHERE jan=? AND master_id=?',(jan,row['master_id']))
+                self.record_history(db,jan,snapshot)
+                db.execute('INSERT OR IGNORE INTO trader_synced_events VALUES(?)',(event['event_id'],))
+        return self.state(jan)
 
     def accept_quote(self,jan,linked,current,previous,force):
         with self.persistence_lock:
@@ -360,6 +389,8 @@ def build_router(service):
     def job(token: str): return service.job(token)
     @router.post('/confirm')
     def confirm(request: ConfirmRequest): return service.confirm_price(request.jan,request.price_yen)
+    @router.post('/unlink')
+    def unlink(request: UnlinkRequest): return service.unlink(request.jan)
     @router.post('/select')
     def choose(request: SelectRequest): return service.choose(request.jan,request.master_id)
     @router.get('/image/{filename}')

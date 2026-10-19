@@ -51,7 +51,7 @@ class SheetEventStore:
 
     def unpack(self,encoded):
         event=json.loads(encoded)
-        if event.get('schema')!=1 or event.get('kind') not in ('select','quote'):
+        if event.get('schema')!=1 or event.get('kind') not in ('select','quote','unlink'):
             raise ValueError('未対応の保存形式です')
         if not re.fullmatch(r'\d{1,32}',str(event.get('jan',''))):
             raise ValueError('JANが不正です')

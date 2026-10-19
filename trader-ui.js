@@ -43,6 +43,18 @@
     const submit=button('候補を検索',()=>{},form);submit.type='submit';
     form.addEventListener('submit',event=>{event.preventDefault();run({query:input.value,search:true});});
     if(state.link) button('紐づけた商品の価格を更新',()=>run({refresh:true}));
+    if(state.link) button('紐づけを解除',async()=>{
+      if(!confirm('このトレーダー商品との紐づけを解除しますか？（間違えて選んだ時に使います）'))return;
+      const own=++generation;
+      try {
+        const next=await api('/unlink',{jan:state.jan});
+        if(own!==generation)return;
+        current=next;
+        const results=heading(next);
+        el('div','紐づけを解除しました。正しい商品を「候補を検索」から選び直してください。',results);
+        if(window.reloadPriceViews) window.reloadPriceViews();
+      } catch(error) { if(own===generation) document.getElementById('trader-progress').textContent='解除できませんでした: '+error.message; }
+    });
     const status=el('div');status.id='trader-progress';status.setAttribute('role','status');
     const results=el('div');results.id='trader-results';
     return results;
