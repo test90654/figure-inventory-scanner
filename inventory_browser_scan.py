@@ -1539,6 +1539,7 @@ def get_scanner_page():
             <div id="stock-price-totals" class="stock-price-totals" aria-live="polite"></div>
             <h3><span>🗄️ 保管在庫一覧</span></h3>
             <input type="text" id="stock-filter" class="stock-filter" placeholder="🔍 商品名・JAN・保管場所で絞り込み" oninput="renderStock()">
+            <select id="stock-quote-filter" class="stock-filter" onchange="renderStock()" aria-label="表示する商品"></select>
             <div id="stock-filter-totals" class="stock-price-totals" style="display:none;" aria-live="polite"></div>
             <div id="stock-items"><p style="color: #777; text-align: center; margin: 8px 0;">読み込み中...</p></div>
 
@@ -1554,6 +1555,8 @@ def get_scanner_page():
             </div>
             <div id="cart-price-totals" class="stock-price-totals" style="display:none;" aria-live="polite"></div>
             <h3><span>📋 持込買取リスト</span></h3>
+            <select id="cart-quote-filter" class="stock-filter" onchange="renderCartPrices()" aria-label="表示する商品"></select>
+            <div id="cart-filter-count" class="search-hint" style="display:none;"></div>
             <div id="cart-items"><p style="color: #777; text-align: center; margin: 8px 0;">まだ商品は追加されていません</p></div>
             
             <button class="btn btn-batch-dl" onclick="downloadAllImages()">📂 画像を個別で一括ダウンロード</button>
@@ -2176,7 +2179,25 @@ def get_scanner_page():
             // 価格欄と合計だけを描き直す（行ごと作り直すと画像が毎回読み込み直されるため）
             function renderCartPrices() {
                 const totals = document.getElementById("cart-price-totals");
+                const filterSelect = document.getElementById("cart-quote-filter");
+                const filterCount = document.getElementById("cart-filter-count");
                 const keys = Object.keys(cart);
+                const quoted = keys.map(jan => Object.assign({ jan }, cartQuotes[jan] || {}));
+                updateQuoteFilterOptions(filterSelect, quoted);
+                filterSelect.style.display = keys.length ? "block" : "none";
+                const key = filterSelect.value || "all";
+                let shown = 0;
+                document.querySelectorAll("#cart-items .item-row").forEach(row => {
+                    const prices = row.querySelector(".cart-prices");
+                    if (!prices) return;
+                    // 価格をまだ取得していない商品は判定できないので表示しておく
+                    const q = cartQuotes[prices.dataset.jan];
+                    const visible = key === "all" || !q || quoteFilterMatches(q, key);
+                    row.style.display = visible ? "" : "none";
+                    if (visible) shown++;
+                });
+                filterCount.style.display = key === "all" ? "none" : "block";
+                filterCount.innerText = `表示 ${shown}種 / 全 ${keys.length}種`;
                 if (keys.length === 0) {
                     totals.style.display = "none";
                     totals.innerHTML = "";
@@ -2442,13 +2463,37 @@ def get_scanner_page():
                 }
             }
 
+            // 紐づけや確認が必要な商品だけを表示するための絞り込み（保管在庫・持込リスト共通）
+            const ACTION_STATUSES = ["needs_review", "multiple", "error", "not_found", "unavailable"];
+            const QUOTE_FILTERS = [
+                ["all", "すべて表示", () => true],
+                ["trader_unlinked", "トレーダー未紐づけ", i => (i.trader_quote || {}).status === "unlinked"],
+                ["lashinbang_unlinked", "らしんばん未紐づけ", i => (i.lashinbang_quote || {}).status === "unlinked"],
+                ["needs_action", "要確認・取得失敗・掲載なし", i => [i.trader_quote, i.lashinbang_quote].some(q => q && ACTION_STATUSES.includes(q.status))],
+            ];
+
+            function quoteFilterMatches(item, key) {
+                const filter = QUOTE_FILTERS.find(f => f[0] === key) || QUOTE_FILTERS[0];
+                return filter[2](item);
+            }
+
+            // 選択肢に件数を表示する（選択中の値は保つ）
+            function updateQuoteFilterOptions(select, items) {
+                const current = select.value || "all";
+                select.innerHTML = QUOTE_FILTERS.map(([key, label, test]) =>
+                    `<option value="${key}">${key === "all" ? label : `${label}（${items.filter(test).length}）`}</option>`
+                ).join("");
+                select.value = current;
+            }
+
             function getFilteredStock() {
                 const q = document.getElementById("stock-filter").value.trim().toLowerCase();
-                if (!q) return stockItems;
+                const key = document.getElementById("stock-quote-filter").value || "all";
                 return stockItems.filter(s =>
-                    (s.title || "").toLowerCase().includes(q) ||
-                    s.jan.includes(q) ||
-                    (s.location || "").toLowerCase().includes(q)
+                    quoteFilterMatches(s, key) && (!q ||
+                        (s.title || "").toLowerCase().includes(q) ||
+                        s.jan.includes(q) ||
+                        (s.location || "").toLowerCase().includes(q))
                 );
             }
 
@@ -2535,6 +2580,7 @@ def get_scanner_page():
 
             window.renderStock = function() {
                 const container = document.getElementById("stock-items");
+                updateQuoteFilterOptions(document.getElementById("stock-quote-filter"), stockItems);
                 const items = getFilteredStock();
 
                 let total = 0;
@@ -2543,7 +2589,8 @@ def get_scanner_page():
                 document.getElementById("stock-total").innerText = total;
                 document.getElementById("stock-price-totals").innerHTML = stockTotalsHtml(stockItems, "在庫全体");
                 const filteredTotals = document.getElementById("stock-filter-totals");
-                const filtering = document.getElementById("stock-filter").value.trim().length > 0;
+                const filtering = document.getElementById("stock-filter").value.trim().length > 0
+                    || document.getElementById("stock-quote-filter").value !== "all";
                 filteredTotals.style.display = filtering ? "block" : "none";
                 filteredTotals.innerHTML = filtering ? stockTotalsHtml(items, "絞り込み結果") : "";
 
