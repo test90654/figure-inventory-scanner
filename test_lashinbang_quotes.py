@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from lashinbang_quotes import LashinbangQuotes, search_quotes, lookup_quote, supported_jan
+from lashinbang_quotes import LashinbangQuotes, codes_of, search_quotes, lookup_quote, supported_jan
 
 JAN = "4580886930067"
 PATH = "/kaitori/detail/8695570"
@@ -58,6 +58,36 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual((quote['price_min'], quote['price_max']), (500, 600))
         self.assertIsNone(quote['price_yen'])
         self.assertEqual(len(quote['candidates']), 2)
+        session.get.assert_called_once()
+
+    def test_item_with_multiple_codes_matches_any_of_them(self):
+        # 実データ: keyword2 に「JAN;別コード」と複数入っている商品がある
+        other = "4573628571673"
+        body = search_body([{**ITEM, 'keyword2': f'{JAN};{other}'}])
+        for code in (JAN, other):
+            quote = search_quotes(body, code)[0]
+            self.assertEqual(quote['price_yen'], 600)
+            self.assertEqual(quote['remote_jan'], code)
+        self.assertEqual(search_quotes(body, '4580886930074'), [])
+        self.assertEqual(codes_of(f' {JAN} ; {other};'), [JAN, other])
+
+    def test_lookup_falls_back_to_keyword_search_when_jan_field_search_misses(self):
+        # 複数コードの商品は k2（JAN欄指定）検索でヒットしないため、キーワード検索で探し直す
+        other = "4573628571673"
+        session = Mock()
+        empty = Mock(text=search_body([]), url='https://lashinbang-f-s.snva.jp/')
+        found = Mock(text=search_body([{**ITEM, 'keyword2': f'{JAN};{other}'}]), url='https://lashinbang-f-s.snva.jp/')
+        session.get.side_effect = [empty, found]
+        quote = lookup_quote(other, session)
+        self.assertEqual(quote['price_yen'], 600)
+        self.assertEqual(session.get.call_count, 2)
+        self.assertEqual(session.get.call_args_list[1].kwargs['params']['q'], other)
+        self.assertEqual(session.get.call_args_list[1].kwargs['params']['controller'], 'lashinbang_kaitori')
+
+    def test_lookup_does_not_retry_when_jan_field_search_hits(self):
+        session = Mock()
+        session.get.return_value = Mock(text=LIST, url='https://lashinbang-f-s.snva.jp/')
+        lookup_quote(JAN, session)
         session.get.assert_called_once()
 
     def test_internal_codes_never_search(self):
