@@ -136,5 +136,26 @@
       }
     } catch(error) { if(own===generation) {panel.replaceChildren();el('div','取得できませんでした: '+error.message);} }
   };
-  window.traderOnItem=data=>{ window.openTraderForJan(data.jan); };
+  // スキャンのたびにパネルを開いて検索を待たないよう、既定では開かない（切り替え可能）
+  const AUTO_KEY='figure_scanner_trader_auto_open';
+  const toggle=document.createElement('label');
+  toggle.id='trader-auto-toggle';
+  toggle.style.cssText='display:flex;align-items:center;justify-content:center;gap:6px;max-width:380px;margin:-6px auto 12px auto;font-size:12px;color:#9fd0ff;cursor:pointer';
+  const autoOpen=document.createElement('input');autoOpen.type='checkbox';
+  try { autoOpen.checked=localStorage.getItem(AUTO_KEY)==='1'; } catch(error) {}
+  autoOpen.addEventListener('change',()=>{ try { localStorage.setItem(AUTO_KEY,autoOpen.checked?'1':'0'); } catch(error) {} });
+  toggle.append(autoOpen,document.createTextNode('スキャン時にトレーダー価格の画面を開く'));
+  (document.querySelector('.search-box') || document.getElementById('result-banner')).insertAdjacentElement('afterend',toggle);
+
+  // 開かない時も、紐づけ済みで価格が古い商品だけは裏で更新しておく（完了すると一覧の価格が自動で更新される）
+  async function refreshLinkedQuietly(jan) {
+    try {
+      const state=await api('/state/'+encodeURIComponent(jan));
+      if(state.link && !state.link.title_changed && state.product && state.stale) await api('/start',{jan,refresh:true});
+    } catch(error) { /* 失敗しても「買取」ボタンから取り直せる */ }
+  }
+  window.traderOnItem=data=>{
+    if(autoOpen.checked) window.openTraderForJan(data.jan);
+    else refreshLinkedQuietly(data.jan);
+  };
 })();
