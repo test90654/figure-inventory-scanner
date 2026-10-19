@@ -575,23 +575,48 @@ class StockDeleteRequest(BaseModel):
   location: str = ""
 
 
+def quotes_for_jans(jans, priority=False):
+  """トレーダー/らしんばんの買取参考価格をまとめて返す（保管在庫・持込リスト共通）"""
+  jans = list(dict.fromkeys(jans))
+  try:
+    trader = trader_service.stock_quotes(jans) if jans else {}
+  except Exception:
+    trader = {jan: {"status": "unavailable", "price_yen": None} for jan in jans}
+  version = lashinbang_quotes.version
+  try:
+    lashinbang = lashinbang_quotes.get_many(jans, priority=priority)
+  except Exception:
+    traceback.print_exc()
+    lashinbang = {jan: {"status": "error", "price_yen": None, "error_message": "紐づけの保存先を確認してください"} for jan in jans}
+  quotes = {
+      jan: {"trader_quote": trader.get(jan), "lashinbang_quote": lashinbang.get(jan)}
+      for jan in jans
+  }
+  return quotes, version
+
+
 @app.get("/api/stock")
 def get_stock():
   items = fetch_stock_rows()
-  try:
-    quotes = trader_service.stock_quotes(s["jan"] for s in items) if items else {}
-  except Exception:
-    quotes = {s["jan"]: {"status": "unavailable", "price_yen": None} for s in items}
-  version = lashinbang_quotes.version
-  try:
-    lashinbang = lashinbang_quotes.get_many(s["jan"] for s in items)
-  except Exception:
-    traceback.print_exc()
-    lashinbang = {s["jan"]: {"status": "error", "price_yen": None, "error_message": "紐づけの保存先を確認してください"} for s in items}
+  quotes, version = quotes_for_jans(s["jan"] for s in items)
   for item in items:
-    item["trader_quote"] = quotes.get(item["jan"])
-    item["lashinbang_quote"] = lashinbang.get(item["jan"])
+    item.update(quotes[item["jan"]])
   return {"items": items, "lashinbang_version": version}
+
+
+class QuotesRequest(BaseModel):
+  jans: list[str]
+
+
+@app.post("/api/quotes")
+def get_quotes(data: QuotesRequest):
+  """持込リストなど、任意のJANの買取参考価格を返す"""
+  jans = [j.strip() for j in data.jans if j and j.strip() and len(j.strip()) <= 32]
+  if len(jans) > 500:
+    raise HTTPException(status_code=400, detail="一度に確認できるのは500件までです")
+  # 店頭で査定と見比べるため、持込リストの商品は保管在庫より先に取得する
+  quotes, version = quotes_for_jans(jans, priority=True)
+  return {"quotes": quotes, "lashinbang_version": version}
 
 
 class LashinbangRefreshRequest(BaseModel):
@@ -1524,6 +1549,7 @@ def get_scanner_page():
                 <div>登録点数: <strong id="total-items" style="color:#00ffcc; font-size:18px;">0</strong> 点</div>
                 <button class="btn-clear" onclick="clearCart()">🗑 リストを空にする</button>
             </div>
+            <div id="cart-price-totals" class="stock-price-totals" style="display:none;" aria-live="polite"></div>
             <h3><span>📋 持込買取リスト</span></h3>
             <div id="cart-items"><p style="color: #777; text-align: center; margin: 8px 0;">まだ商品は追加されていません</p></div>
             
@@ -1585,6 +1611,11 @@ def get_scanner_page():
             const STORAGE_KEY = `figure_scanner_cart_${currentBox}`;
 
             let cart = {};
+            // 持込リストの買取参考価格 { jan: { trader_quote, lashinbang_quote } }
+            let cartQuotes = {};
+            let cartQuoteKeys = "";
+            let cartQuotesLoading = false;
+            let cartQuotesQueued = false;
             let html5QrCode = null;
             let isScanning = false;
             let currentBannerJan = "";
@@ -1632,7 +1663,7 @@ def get_scanner_page():
                 document.getElementById("result-banner").style.display = "none";
                 document.getElementById("error-msg").innerText = "";
                 currentBannerJan = "";
-                if (isStock) loadStock();
+                if (isStock) loadStock(); else loadCartQuotes();
             }
 
             window.saveLocation = function() {
@@ -2104,6 +2135,7 @@ def get_scanner_page():
                 if (keys.length === 0) {
                     container.innerHTML = '<p style="color: #777; text-align: center; margin: 8px 0;">まだ商品は追加されていません</p>';
                     document.getElementById("total-items").innerText = "0";
+                    renderCartPrices();
                     return;
                 }
                 keys.forEach(code => {
@@ -2118,6 +2150,7 @@ def get_scanner_page():
                             <div class="item-title">${item.title}</div>
                             <div class="item-jan">コード: ${item.jan}</div>
                             <div class="item-quote">出所: <a href="${item.source_url || '#'}" target="_blank" rel="noopener">${item.quote_label || '流通 / 商品カタログ'}</a></div>
+                            <div class="cart-prices" data-jan="${escapeHtml(code)}"></div>
                         </div>
                         <div class="qty-control">
                             <button class="qty-btn" onclick="changeQty('${code}', -1)">-</button>
@@ -2132,6 +2165,71 @@ def get_scanner_page():
                     container.appendChild(row);
                 });
                 document.getElementById("total-items").innerText = totalItems;
+                renderCartPrices();
+                // 商品の顔ぶれが変わった時だけ価格を取り直す（数量だけの変更は手元で再計算）
+                if (Object.keys(cart).sort().join(",") !== cartQuoteKeys) loadCartQuotes();
+            }
+
+            // 価格欄と合計だけを描き直す（行ごと作り直すと画像が毎回読み込み直されるため）
+            function renderCartPrices() {
+                const totals = document.getElementById("cart-price-totals");
+                const keys = Object.keys(cart);
+                if (keys.length === 0) {
+                    totals.style.display = "none";
+                    totals.innerHTML = "";
+                    return;
+                }
+                document.querySelectorAll("#cart-items .cart-prices").forEach(el => {
+                    const item = cart[el.dataset.jan];
+                    if (!item) return;
+                    const q = cartQuotes[el.dataset.jan];
+                    el.innerHTML = q
+                        ? stockPriceHtml(q.trader_quote, "トレーダー", item.count) + stockPriceHtml(q.lashinbang_quote, "らしんばん", item.count)
+                        : '<div class="stock-price"><small>買取価格を確認中…</small></div>';
+                });
+                const rows = keys.map(jan => ({
+                    count: cart[jan].count,
+                    trader_quote: cartQuotes[jan] && cartQuotes[jan].trader_quote,
+                    lashinbang_quote: cartQuotes[jan] && cartQuotes[jan].lashinbang_quote,
+                }));
+                totals.style.display = "block";
+                totals.innerHTML = stockTotalsHtml(rows, "持込リスト");
+            }
+
+            async function loadCartQuotes() {
+                if (cartQuotesLoading) {
+                    cartQuotesQueued = true;
+                    return;
+                }
+                const jans = Object.keys(cart);
+                cartQuoteKeys = jans.slice().sort().join(",");
+                if (jans.length === 0) {
+                    cartQuotes = {};
+                    renderCartPrices();
+                    return;
+                }
+                cartQuotesLoading = true;
+                try {
+                    const res = await fetchWithTimeout('/api/quotes', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ jans })
+                    });
+                    if (!res.ok) throw new Error("HTTP " + res.status);
+                    const data = await res.json();
+                    cartQuotes = data.quotes || {};
+                    lashinbangVersion = data.lashinbang_version;
+                    renderCartPrices();
+                } catch (e) {
+                    // 取れなかった時は前回の表示のまま。次の更新確認で取り直す
+                    cartQuoteKeys = "";
+                } finally {
+                    cartQuotesLoading = false;
+                    if (cartQuotesQueued) {
+                        cartQuotesQueued = false;
+                        loadCartQuotes();
+                    }
+                }
             }
 
             window.exportList = function() {
@@ -2749,8 +2847,12 @@ def get_scanner_page():
                         setSyncStatus("ok", "☁ 同期済み");
                     }
 
-                    if (currentMode === "stock" && ((stockVersion !== null && st.stock_version !== stockVersion) || (traderVersion !== null && st.trader_version !== traderVersion) || (lashinbangVersion !== null && st.lashinbang_version !== lashinbangVersion))) {
+                    const quotesChanged = (traderVersion !== null && st.trader_version !== traderVersion) || (lashinbangVersion !== null && st.lashinbang_version !== lashinbangVersion);
+                    if (currentMode === "stock" && ((stockVersion !== null && st.stock_version !== stockVersion) || quotesChanged)) {
                         loadStock();
+                    }
+                    if (currentMode === "cart" && quotesChanged && Object.keys(cart).length > 0) {
+                        loadCartQuotes();
                     }
                     stockVersion = st.stock_version;
                     traderVersion = st.trader_version;
