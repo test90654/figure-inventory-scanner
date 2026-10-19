@@ -23,7 +23,7 @@ from playwright.sync_api import sync_playwright
 from mercari_search import build_url as build_mercari_url
 from mercari_search import price_summary, search_mercari
 from trader_integration import TraderService, build_router
-from lashinbang_quotes import LashinbangQuotes, supported_jan
+from lashinbang_quotes import LashinbangQuotes, codes_of, supported_jan
 
 app = FastAPI(title="Figure Inventory Cloud Edition")
 
@@ -284,8 +284,9 @@ def lookup_lashinbang_by_jan(jan: str):
     items = json.loads(body)["kotohaco"]["result"]["items"]
 
     # 全文検索なので部分一致も混ざる。JANが完全一致する商品だけを採用する
+    # （JAN欄には「JAN;別コード」と複数入っていることがあるので、どれかに一致すればよい）
     for item in items:
-      if (item.get("keyword2") or "").strip() != jan:
+      if jan not in codes_of(item.get("keyword2")):
         continue
       # 「【未開封】」などの状態表記を商品名から外す
       title = re.sub(r"^(【[^】]*】\s*)+", "", item.get("title") or "").strip()

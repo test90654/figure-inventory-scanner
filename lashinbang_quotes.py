@@ -33,6 +33,11 @@ def supported_jan(jan):
     return bool(re.fullmatch(r"[0-9]{13}", jan)) and not jan.startswith("20")
 
 
+def codes_of(value):
+    """keyword2 には「JAN;別コード」のように複数のコードが入っていることがある"""
+    return [code for code in re.split(r"[;,\s]+", value or "") if code]
+
+
 def search_quotes(body, jan=None, max_results=5, allow_partial=False):
     # Same JSONP search used by the official kaitori page; never execute it.
     match = re.fullmatch(r"\s*callback\s*\((.*)\);?\s*", body, re.DOTALL)
@@ -53,7 +58,8 @@ def search_quotes(body, jan=None, max_results=5, allow_partial=False):
     seen = set()
     for item in items:
         # number10=1 is the standard buyback product, excluding retail stock.
-        if (jan is not None and item.get("keyword2", "").strip() != jan) or item.get("number10") != 1:
+        codes = codes_of(item.get("keyword2", ""))
+        if (jan is not None and jan not in codes) or item.get("number10") != 1:
             continue
         product_id = str(item.get("itemid", ""))
         if not re.fullmatch(r"[0-9]+", product_id):
@@ -68,7 +74,7 @@ def search_quotes(body, jan=None, max_results=5, allow_partial=False):
         quotes.append({"status": "ok" if valid else "needs_review",
                        "price_yen": max(values) if valid else None,
                        "title": item.get("title", ""), "master_id": product_id,
-                       "remote_jan": item.get("keyword2", "").strip(),
+                       "remote_jan": jan if jan is not None else (codes[0] if codes else ""),
                        "image_url": item.get("image", "") if urlparse(item.get("image", "")).scheme == "https" and urlparse(item.get("image", "")).netloc in ("img.lashinbang.com", "devimg.lashinbang.com") else "",
                        "source_url": BASE + "/kaitori/detail/" + product_id})
     return quotes
@@ -94,6 +100,11 @@ def lookup_quote(jan, session=None):
                   "searchbox": "1", "limit": "6", "o": "0", "sort": "Score,Number18",
                   "controller": "lashinbang_kaitori", "callback": "callback"}
         matches = search_quotes(fetch("https://lashinbang-f-s.snva.jp/", params), jan)
+        if matches == []:
+            # JAN欄に複数コードが入った商品は k2 検索でヒットしないため、キーワード検索で探し直す
+            # （コードの一致は search_quotes で確認する）
+            params = {**{k: v for k, v in params.items() if k != "k2"}, "q": jan}
+            matches = search_quotes(fetch("https://lashinbang-f-s.snva.jp/", params), jan)
         if matches is None:
             return {"status": "needs_review", "price_yen": None}
         if len(matches) == 1:
@@ -117,12 +128,20 @@ def catalog_search(query=None, jan=None):
         params["q"] = search_query(query)
         if not params["q"]:
             raise ValueError("検索語を入力してください")
-    response = requests.get("https://lashinbang-f-s.snva.jp/", params=params, headers=HEADERS, timeout=(5, 15))
-    response.raise_for_status()
-    if urlparse(response.url).netloc != "lashinbang-f-s.snva.jp":
-        raise ValueError("検索先が変わりました")
-    response.encoding = "utf-8"
-    return search_quotes(response.text, jan=jan, max_results=30, allow_partial=True)
+    def fetch(params):
+        response = requests.get("https://lashinbang-f-s.snva.jp/", params=params, headers=HEADERS, timeout=(5, 15))
+        response.raise_for_status()
+        if urlparse(response.url).netloc != "lashinbang-f-s.snva.jp":
+            raise ValueError("検索先が変わりました")
+        response.encoding = "utf-8"
+        return search_quotes(response.text, jan=jan, max_results=30, allow_partial=True)
+
+    results = fetch(params)
+    if jan and not results:
+        # 複数コードの商品は k2 検索でヒットしないため、キーワード検索で探し直す
+        params = {**{k: v for k, v in params.items() if k != "k2"}, "q": jan}
+        results = fetch(params)
+    return results
 
 
 class LashinbangQuotes:
