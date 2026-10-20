@@ -24,6 +24,12 @@ SPREADSHEET_ID = "1CHnUUP_9uiZYaWzbpoaTIjYwyFY5YBAv4x5M3gka2T0"
 sheet = client.open_by_key(SPREADSHEET_ID).sheet1
 
 
+def should_repair_name(stored, site_name):
+    """以前の版は商品名を40文字で切って保存していた。保存済みの名前がサイトの名前の先頭部分なら、切れた名前とみなして直す"""
+    stored = " ".join(str(stored).split())
+    return bool(stored) and len(site_name) > len(stored) and site_name.startswith(stored)
+
+
 def bulk_import_all_pasomaru():
     print("🚀 ぱそまる全商品の一括インポート（全ページ自動走査）を開始します...")
 
@@ -36,10 +42,14 @@ def bulk_import_all_pasomaru():
     print("📖 スプレッドシートから既存のデータを読み込み中...")
     existing_records = sheet.get_all_values()
     existing_jans = set()
-    for row in existing_records:
+    # JAN → (行番号, 保存済みの商品名)。切れた商品名を直すのに使う
+    existing_names = {}
+    for i, row in enumerate(existing_records, start=1):
         if len(row) > 0 and row[0]:
             existing_jans.add(row[0])
+            existing_names.setdefault(row[0], (i, row[1] if len(row) > 1 else ""))
     print(f"📌 既存の登録済みJAN数: {len(existing_jans)} 件")
+    total_repaired = 0
 
     page = 1
     total_new_added = 0
@@ -80,6 +90,7 @@ def bulk_import_all_pasomaru():
             break
 
         new_rows_in_page = []
+        repairs = []
         for row in product_rows:
             # 商品名
             header_div = row.find("div", class_="products-row-header")
@@ -109,6 +120,13 @@ def bulk_import_all_pasomaru():
                     jan = line.find_all("span")[-1].text.strip()
                     break
 
+            # 登録済みで、商品名が途中で切れているものは直す
+            if jan in existing_names:
+                row_no, stored = existing_names[jan]
+                if should_repair_name(stored, clean_title):
+                    repairs.append({"range": f"B{row_no}", "values": [[clean_title]]})
+                    existing_names[jan] = (row_no, clean_title)
+
             # 未登録のJANのみ追加リストへ
             if jan and jan not in existing_jans:
                 new_rows_in_page.append([jan, clean_title, image_url, price])
@@ -127,13 +145,18 @@ def bulk_import_all_pasomaru():
                 f"ℹ️️ ページ {page}: すべて既存登録済みの商品でした（新規追加 0 件）"
             )
 
+        if repairs:
+            sheet.batch_update(repairs)
+            total_repaired += len(repairs)
+            print(f"🔧 ページ {page}: 途中で切れていた商品名 {len(repairs)} 件を直しました（累計: {total_repaired}件）")
+
         # サーバーへのマナーとして1秒待つ
         time.sleep(1)
         page += 1
 
     print(
         f"\n🎉 すべての処理が完了しました！ 今回新たに追加された総件数: {total_new_added}"
-        " 件"
+        f" 件 / 商品名を直した件数: {total_repaired} 件"
     )
 
 
