@@ -3,8 +3,19 @@ name: Nightly Pasomaru Import
 on:
   schedule:
     # 毎日 UTC 18:00（日本時間 翌朝 3:00）に実行
-    - cron: '0 18 * * *'
-  workflow_dispatch: # 手動でも実行できるようにする
+    - cron: '0 18 * * 0-5'
+    # 日本時間の日曜朝は全件走査し、深いページの未登録商品も回収する
+    - cron: '0 18 * * 6'
+  workflow_dispatch:
+    inputs:
+      full_scan:
+        description: '全ページ走査（取りこぼし回収・商品名補修）'
+        type: boolean
+        default: false
+
+concurrency:
+  group: pasomaru-import
+  cancel-in-progress: false
 
 jobs:
   run-import:
@@ -30,4 +41,11 @@ jobs:
           echo "$GCP_CREDENTIALS" > credentials.json
 
       - name: Run import script
-        run: python import_pasomaru.py
+        env:
+          FULL_SCAN: ${{ github.event_name == 'schedule' && github.event.schedule == '0 18 * * 6' || inputs.full_scan == true }}
+        run: |
+          if [ "$FULL_SCAN" = "true" ]; then
+            python -u import_pasomaru.py --full-scan
+          else
+            python -u import_pasomaru.py --max-known-pages 5
+          fi
