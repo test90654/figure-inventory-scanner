@@ -1,5 +1,5 @@
 import os
-import sqlite3
+import argparse
 import time
 from bs4 import BeautifulSoup
 import gspread
@@ -10,18 +10,15 @@ import requests
 base_dir = os.path.dirname(os.path.abspath(__file__))
 credential_path = os.path.join(base_dir, "credentials.json")
 
-# --- スプレッドシート接続設定 ---
-scope = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive",
-]
-creds = ServiceAccountCredentials.from_json_keyfile_name(
-    credential_path, scope
-)
-client = gspread.authorize(creds)
-
-SPREADSHEET_ID = "1CHnUUP_9uiZYaWzbpoaTIjYwyFY5YBAv4x5M3gka2T0"
-sheet = client.open_by_key(SPREADSHEET_ID).sheet1
+def connect_sheet():
+    """実行時にのみ認証し、テスト時は外部接続しない。"""
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = ServiceAccountCredentials.from_json_keyfile_name(credential_path, scope)
+    client = gspread.authorize(creds)
+    return client.open_by_key("1CHnUUP_9uiZYaWzbpoaTIjYwyFY5YBAv4x5M3gka2T0").sheet1
 
 
 def should_repair_name(stored, site_name):
@@ -30,8 +27,12 @@ def should_repair_name(stored, site_name):
     return bool(stored) and len(site_name) > len(stored) and site_name.startswith(stored)
 
 
-def bulk_import_all_pasomaru():
-    print("🚀 ぱそまる全商品の一括インポート（全ページ自動走査）を開始します...")
+def bulk_import_all_pasomaru(sheet=None, *, full_scan=False, max_known_pages=5):
+    if max_known_pages < 1:
+        raise ValueError("max_known_pages must be positive")
+    if sheet is None:
+        sheet = connect_sheet()
+    print(f"🚀 ぱそまるインポート開始（{'全件' if full_scan else '差分'}走査）")
 
     # 1. ヘッダー自動作成
     if not sheet.row_values(1):
@@ -44,11 +45,14 @@ def bulk_import_all_pasomaru():
     existing_jans = set()
     # JAN → (行番号, 保存済みの商品名)。切れた商品名を直すのに使う
     existing_names = {}
-    for i, row in enumerate(existing_records, start=1):
+    for i, row in enumerate(existing_records[1:], start=2):
         if len(row) > 0 and row[0]:
             existing_jans.add(row[0])
             existing_names.setdefault(row[0], (i, row[1] if len(row) > 1 else ""))
     print(f"📌 既存の登録済みJAN数: {len(existing_jans)} 件")
+    # 初回登録は全件取得する。差分走査は新着順を保証できないため週次全件走査と併用する。
+    full_scan = full_scan or not existing_jans
+    known_pages = 0
     total_repaired = 0
 
     page = 1
@@ -65,7 +69,7 @@ def bulk_import_all_pasomaru():
         }
 
         print(f"📖 ページ {page} を取得中... ({url})")
-        
+
         # 接続エラーやタイムアウト対策（リトライ＆長めのタイムアウト）
         response = None
         for retry in range(3):
@@ -77,9 +81,8 @@ def bulk_import_all_pasomaru():
                 time.sleep(3)
 
         if response is None or response.status_code != 200:
-            status = response.status_code if response else "不明"
-            print(f"⚠️ ページ取得に失敗したため、全ページの走査を終了します (ステータス: {status})")
-            break
+            status = response.status_code if response is not None else "不明"
+            raise RuntimeError(f"ページ {page} の取得に失敗しました (ステータス: {status})")
 
         soup = BeautifulSoup(response.text, "html.parser")
         product_rows = soup.find_all("div", class_="products-row")
@@ -91,6 +94,7 @@ def bulk_import_all_pasomaru():
 
         new_rows_in_page = []
         repairs = []
+        valid_jans = 0
         for row in product_rows:
             # 商品名
             header_div = row.find("div", class_="products-row-header")
@@ -119,6 +123,9 @@ def bulk_import_all_pasomaru():
                 if label and "JAN" in label.text:
                     jan = line.find_all("span")[-1].text.strip()
                     break
+
+            if jan:
+                valid_jans += 1
 
             # 登録済みで、商品名が途中で切れているものは直す
             if jan in existing_names:
@@ -150,15 +157,31 @@ def bulk_import_all_pasomaru():
             total_repaired += len(repairs)
             print(f"🔧 ページ {page}: 途中で切れていた商品名 {len(repairs)} 件を直しました（累計: {total_repaired}件）")
 
+        # JANが読めない商品は「既存」と断定しない。
+        if valid_jans == len(product_rows) and not new_rows_in_page:
+            known_pages += 1
+        else:
+            known_pages = 0
+        if not full_scan and known_pages >= max_known_pages:
+            print(f"🏁 新規JANなしが {known_pages} ページ連続したため差分走査を終了します。")
+            break
+
         # サーバーへのマナーとして1秒待つ
         time.sleep(1)
         page += 1
 
     print(
-        f"\n🎉 すべての処理が完了しました！ 今回新たに追加された総件数: {total_new_added}"
+        f"\n🎉 走査完了！ 最終確認ページ: {page} / 今回新たに追加された総件数: {total_new_added}"
         f" 件 / 商品名を直した件数: {total_repaired} 件"
     )
 
 
 if __name__ == "__main__":
-    bulk_import_all_pasomaru()
+    parser = argparse.ArgumentParser(description="ぱそまる商品の差分・全件インポート")
+    parser.add_argument("--full-scan", action="store_true", help="全ページを走査する")
+    parser.add_argument("--max-known-pages", type=int, default=5,
+                        help="差分走査で終了する新規JANなしの連続ページ数（既定: 5）")
+    args = parser.parse_args()
+    if args.max_known_pages < 1:
+        parser.error("--max-known-pages は1以上で指定してください")
+    bulk_import_all_pasomaru(full_scan=args.full_scan, max_known_pages=args.max_known_pages)
