@@ -20,6 +20,7 @@ from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel
 import requests
 from playwright.sync_api import sync_playwright
+from ebay_search import EbayClient, EbayNotConfigured
 from mercari_search import build_url as build_mercari_url
 from mercari_search import price_summary, search_mercari
 from trader_integration import TraderService, build_router
@@ -1076,6 +1077,23 @@ mercari_cache = {}
 mercari_lock = threading.Lock()
 
 
+# eBay 公式 Browse API（キーは Render の環境変数に設定。コードには書かない）
+ebay_client = EbayClient(os.environ.get("EBAY_CLIENT_ID"), os.environ.get("EBAY_CLIENT_SECRET"))
+
+
+@app.get("/api/ebay/search")
+def ebay_price(jan: str = "", q: str = "", jp: int = 0):
+  try:
+    return ebay_client.search(jan=jan, query=q, japan_only=bool(jp))
+  except EbayNotConfigured as e:
+    raise HTTPException(status_code=503, detail=str(e))
+  except ValueError as e:
+    raise HTTPException(status_code=400, detail=str(e))
+  except Exception as e:
+    traceback.print_exc()
+    raise HTTPException(status_code=502, detail=str(e))
+
+
 @app.get("/api/mercari_price")
 def mercari_price(q: str, status: str = "sold_out"):
   q = q.strip()
@@ -1386,6 +1404,9 @@ def get_scanner_page():
             .mercari-btn { background: #e8384f; color: white; border: none; border-radius: 4px; padding: 4px 5px; cursor: pointer; font-size: 10px; }
             .mercari-btn:hover { background: #c92a40; }
 
+            #ebay-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); display: none; justify-content: center; align-items: center; z-index: 1000; }
+            #ebay-overlay .mercari-tabs button.active { background: #3665f3; border-color: #3665f3; }
+            .ebay-btn { background: #3665f3; color: white; border: none; border-radius: 4px; padding: 4px 5px; cursor: pointer; font-size: 10px; }
             #mercari-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); display: none; justify-content: center; align-items: center; z-index: 1000; }
             .mercari-tabs { display: flex; gap: 6px; margin-bottom: 8px; }
             .mercari-tabs button { flex: 1; background: #333; color: #aaa; border: 1px solid #555; border-radius: 4px; padding: 5px; font-size: 11px; cursor: pointer; }
@@ -1594,6 +1615,24 @@ def get_scanner_page():
         </div>
 
         <!-- メルカリ相場モーダル -->
+        <div id="ebay-overlay" onclick="if (event.target === this) closeEbayModal()">
+            <div class="modal-content">
+                <h3>🌏 eBay 出品中の価格</h3>
+                <div id="ebay-item-title" style="font-size:11px; color:#aaa; margin-bottom:6px;"></div>
+                <div class="mercari-tabs">
+                    <button id="ebay-tab-jan" class="active" onclick="setEbayMode('jan')">JANで検索</button>
+                    <button id="ebay-tab-keyword" onclick="setEbayMode('keyword')">英語キーワード</button>
+                </div>
+                <input type="text" id="ebay-query" style="display:none;" placeholder="例: Sabito Vibration Stars figure" onkeydown="if (event.key === 'Enter') fetchEbayPrice()">
+                <label style="display:flex; align-items:center; gap:6px; margin-top:6px;"><input type="checkbox" id="ebay-jp-only" onchange="fetchEbayPrice()"> 日本からの出品だけ</label>
+                <div id="ebay-result" style="font-size:12px; color:#ccc; margin-top:6px;"></div>
+                <div class="modal-btns">
+                    <button class="btn" style="background:#555; margin-top:0;" onclick="closeEbayModal()">閉じる</button>
+                    <button class="btn" style="background:#3665f3; margin-top:0;" onclick="fetchEbayPrice()">再検索</button>
+                </div>
+            </div>
+        </div>
+
         <div id="mercari-overlay" onclick="if (event.target === this) closeMercariModal()">
             <div class="modal-content">
                 <h3>💴 メルカリ相場</h3>
@@ -1973,6 +2012,78 @@ def get_scanner_page():
                 }
             }
 
+            // ===== eBay（公式APIで出品中の価格を検索） =====
+            let ebayJan = "";
+            let ebayMode = "jan";
+            let ebayReqId = 0;
+            const usd = n => (n == null ? "-" : "$" + Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+
+            window.openEbayModal = function(jan, title) {
+                ebayJan = /^\d{8,14}$/.test(jan || "") && !isInternalCode(jan) ? jan : "";
+                document.getElementById("ebay-item-title").innerText = title || "";
+                document.getElementById("ebay-overlay").style.display = "flex";
+                // JANが無い（独自コード）商品は最初から英語キーワード検索
+                setEbayMode(ebayJan ? "jan" : "keyword");
+            }
+
+            window.closeEbayModal = function() {
+                document.getElementById("ebay-overlay").style.display = "none";
+                ebayReqId++;
+            }
+
+            window.setEbayMode = function(mode) {
+                ebayMode = mode === "keyword" || !ebayJan ? "keyword" : "jan";
+                ["jan", "keyword"].forEach(m => document.getElementById(`ebay-tab-${m}`).classList.toggle("active", m === ebayMode));
+                document.getElementById("ebay-tab-jan").disabled = !ebayJan;
+                document.getElementById("ebay-query").style.display = ebayMode === "keyword" ? "block" : "none";
+                if (ebayMode === "keyword" && !document.getElementById("ebay-query").value.trim()) {
+                    document.getElementById("ebay-result").innerHTML = "eBayは英語の出品が中心です。英語の商品名（例: Sabito Vibration Stars figure）を入力して検索してください。";
+                    return;
+                }
+                fetchEbayPrice();
+            }
+
+            window.fetchEbayPrice = async function() {
+                const box = document.getElementById("ebay-result");
+                const q = document.getElementById("ebay-query").value.trim();
+                if (ebayMode === "keyword" && !q) { box.innerHTML = "英語のキーワードを入力してください。"; return; }
+                const jp = document.getElementById("ebay-jp-only").checked ? 1 : 0;
+                const params = ebayMode === "jan" ? `jan=${encodeURIComponent(ebayJan)}` : `q=${encodeURIComponent(q)}`;
+                const reqId = ++ebayReqId;
+                box.innerHTML = "⏳ eBayを検索中...";
+                try {
+                    const res = await fetchWithTimeout(`/api/ebay/search?${params}&jp=${jp}`);
+                    if (reqId !== ebayReqId) return;
+                    const data = await res.json().catch(() => ({}));
+                    if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : "HTTP " + res.status);
+                    const s = data.summary;
+                    const soldLink = `<a href="${escapeHtml(data.sold_url)}" target="_blank" rel="noopener" style="color:#38bdf8;">eBayで売れた価格を見る</a>`;
+                    if (!s.count) {
+                        box.innerHTML = (ebayMode === "jan"
+                            ? "このJANで登録された出品は見つかりませんでした。「英語キーワード」で探してみてください。"
+                            : "出品が見つかりませんでした。") + `<br>${soldLink}`;
+                        return;
+                    }
+                    const list = data.items.slice(0, 30).map(i => `
+                        <a href="${escapeHtml(i.url)}" target="_blank" rel="noopener">
+                            <img src="${escapeHtml(i.image)}" loading="lazy" onerror="this.style.visibility='hidden'">
+                            <span class="t">${escapeHtml(i.title)}<br><small style="color:#888;">${escapeHtml(i.condition || "")}${i.country ? " ・ " + escapeHtml(i.country) + "から" : ""}${(i.buying_options || []).includes("AUCTION") ? " ・ オークション" : ""}</small></span>
+                            <span class="p">${usd(i.price)}${i.shipping != null ? `<br><small style="color:#aaa;">送料 ${usd(i.shipping)}</small>` : ""}</span>
+                        </a>`).join("");
+                    box.innerHTML = `
+                        <div class="mercari-stats">
+                            <div><small>最安</small><b>${usd(s.min)}</b></div>
+                            <div><small>中央値</small><b>${usd(s.median)}</b></div>
+                            <div><small>最高</small><b>${usd(s.max)}</b></div>
+                        </div>
+                        <div style="font-size:10px; color:#888; margin-bottom:4px;">出品中 ${s.count}件（送料別・${escapeHtml(s.currency)}） ・ ${soldLink}</div>
+                        <div class="mercari-list">${list}</div>`;
+                } catch (e) {
+                    if (reqId !== ebayReqId) return;
+                    box.innerHTML = `⚠️ ${escapeHtml(e.message)}`;
+                }
+            }
+
             window.openGoogleSearch = function() {
                 const jan = document.getElementById("modal-jan").value.trim();
                 const q = jan || document.getElementById("modal-title").value.trim();
@@ -2165,6 +2276,7 @@ def get_scanner_page():
                             <button class="img-edit-btn" onclick="openEditImageModal('${code}')">画像</button>
                             <button class="mercari-btn" onclick="openMercariModal(cart['${code}'].title)">相場</button>
                             <button class="mercari-btn" onclick="openTraderForJan('${code}')">買取</button>
+                            <button class="ebay-btn" onclick="openEbayModal('${code}', cart['${code}'].title)">eBay</button>
                             <button class="del-btn" onclick="removeItem('${code}')">×</button>
                         </div>
                     `;
@@ -2651,6 +2763,7 @@ def get_scanner_page():
                                 <button class="img-edit-btn" data-act="img" ${attrs}>画像</button>
                                 <button class="mercari-btn" data-act="mercari" ${attrs}>相場</button>
                                 <button class="mercari-btn" data-act="trader" ${attrs}>買取</button>
+                                <button class="ebay-btn" data-act="ebay" ${attrs}>eBay</button>
                                 <button class="del-btn" data-act="del" ${attrs}>×</button>
                             </div>
                         </div>`;
@@ -2681,6 +2794,11 @@ def get_scanner_page():
                     case "mercari": {
                         const item = findStock(jan, location);
                         if (item) openMercariModal(item.title);
+                        break;
+                    }
+                    case "ebay": {
+                        const item = findStock(jan, location);
+                        if (item) openEbayModal(jan, item.title);
                         break;
                     }
                 }
