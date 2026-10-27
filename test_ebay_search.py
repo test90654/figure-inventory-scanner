@@ -2,6 +2,8 @@ import base64
 import unittest
 from unittest.mock import Mock
 
+import requests
+
 import ebay_search
 from ebay_search import EbayClient, EbayNotConfigured
 
@@ -98,6 +100,43 @@ class EbayClientTests(unittest.TestCase):
     def test_requires_jan_or_query(self):
         with self.assertRaises(ValueError):
             self.client.search()
+
+
+def fx_response(rate, date="2026-10-26"):
+    return Mock(status_code=200, raise_for_status=Mock(), json=Mock(return_value={"base": "USD", "date": date, "rates": {"JPY": rate}}))
+
+
+class FxRatesTests(unittest.TestCase):
+    def setUp(self):
+        self.session = Mock()
+        self.fx = ebay_search.FxRates(session=self.session)
+
+    def test_usd_to_jpy_rate(self):
+        self.session.get.return_value = fx_response(157.45)
+        self.assertEqual(self.fx.to_jpy("USD"), {"rate": 157.45, "date": "2026-10-26"})
+        self.assertEqual(self.session.get.call_args.kwargs["params"], {"base": "USD", "symbols": "JPY"})
+
+    def test_rate_is_cached(self):
+        self.session.get.return_value = fx_response(157.45)
+        self.fx.to_jpy("USD")
+        self.fx.to_jpy("usd")
+        self.assertEqual(self.session.get.call_count, 1)
+
+    def test_falls_back_to_last_rate_on_error(self):
+        self.session.get.return_value = fx_response(150.0)
+        self.fx.to_jpy("USD")
+        self.fx.rates["USD"]["fetched_at"] = 0  # 期限切れにする
+        self.session.get.side_effect = requests.ConnectionError("down")
+        self.assertEqual(self.fx.to_jpy("USD")["rate"], 150.0)
+
+    def test_none_when_never_fetched(self):
+        self.session.get.side_effect = requests.ConnectionError("down")
+        self.assertIsNone(self.fx.to_jpy("USD"))
+        self.assertIsNone(self.fx.to_jpy(""))
+
+    def test_jpy_needs_no_request(self):
+        self.assertEqual(self.fx.to_jpy("JPY")["rate"], 1.0)
+        self.session.get.assert_not_called()
 
 
 if __name__ == "__main__":

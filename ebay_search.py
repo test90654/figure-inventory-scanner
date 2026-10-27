@@ -16,6 +16,9 @@ TOKEN_URL = "https://api.ebay.com/identity/v1/oauth2/token"
 SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
 SCOPE = "https://api.ebay.com/oauth/api_scope"
 CACHE_TTL = 3600
+# 為替レート（欧州中央銀行の参照レート。キー不要・平日1回更新）
+FX_URL = "https://api.frankfurter.dev/v1/latest"
+FX_TTL = 6 * 3600
 
 
 class EbayNotConfigured(RuntimeError):
@@ -62,6 +65,37 @@ def _summary(items):
     prices = sorted(i["price"] for i in items if i["price"] is not None and i["currency"] == currency)
     return {"count": len(prices), "min": prices[0], "median": round(statistics.median(prices), 3),
             "max": prices[-1], "currency": currency}
+
+
+class FxRates:
+    """円換算用の為替レート。取れないときは最後に取れた値、それも無ければ None"""
+
+    def __init__(self, session=None):
+        self.session = session or requests.Session()
+        self.lock = threading.Lock()
+        self.rates = {}  # currency -> {"rate", "date", "fetched_at"}
+
+    def to_jpy(self, currency):
+        currency = (currency or "").upper()
+        if not currency:
+            return None
+        if currency == "JPY":
+            return {"rate": 1.0, "date": ""}
+        with self.lock:
+            cached = self.rates.get(currency)
+            if cached and time.time() - cached["fetched_at"] < FX_TTL:
+                return {"rate": cached["rate"], "date": cached["date"]}
+            try:
+                response = self.session.get(FX_URL, params={"base": currency, "symbols": "JPY"}, timeout=(5, 10))
+                response.raise_for_status()
+                body = response.json()
+                cached = {"rate": float(body["rates"]["JPY"]), "date": body.get("date", ""), "fetched_at": time.time()}
+                self.rates[currency] = cached
+            except Exception:
+                pass  # 為替が取れなくてもeBayの検索結果は返す（ドルのみ表示）
+            if not cached:
+                return None
+            return {"rate": cached["rate"], "date": cached["date"]}
 
 
 class EbayClient:

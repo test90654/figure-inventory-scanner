@@ -20,7 +20,7 @@ from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel
 import requests
 from playwright.sync_api import sync_playwright
-from ebay_search import EbayClient, EbayNotConfigured
+from ebay_search import EbayClient, EbayNotConfigured, FxRates
 from mercari_search import build_url as build_mercari_url
 from mercari_search import price_summary, search_mercari
 from trader_integration import TraderService, build_router
@@ -1079,12 +1079,15 @@ mercari_lock = threading.Lock()
 
 # eBay 公式 Browse API（キーは Render の環境変数に設定。コードには書かない）
 ebay_client = EbayClient(os.environ.get("EBAY_CLIENT_ID"), os.environ.get("EBAY_CLIENT_SECRET"))
+fx_rates = FxRates()
 
 
 @app.get("/api/ebay/search")
 def ebay_price(jan: str = "", q: str = "", jp: int = 0):
   try:
-    return ebay_client.search(jan=jan, query=q, japan_only=bool(jp))
+    result = ebay_client.search(jan=jan, query=q, japan_only=bool(jp))
+    # 画面で円換算するためのレート（取れなければ null → ドルのみ表示）
+    return {**result, "jpy": fx_rates.to_jpy(result["summary"]["currency"])}
   except EbayNotConfigured as e:
     raise HTTPException(status_code=503, detail=str(e))
   except ValueError as e:
@@ -2057,6 +2060,11 @@ def get_scanner_page():
                     const data = await res.json().catch(() => ({}));
                     if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : "HTTP " + res.status);
                     const s = data.summary;
+                    // 円換算（為替が取れないときや通貨が違う出品はドルのみ）
+                    const fx = data.jpy;
+                    const toYen = (n, cur) => (n == null || !fx || (cur && cur !== s.currency) ? null : Math.round(n * fx.rate));
+                    const yenText = (n, cur) => { const y = toYen(n, cur); return y == null ? usd(n) : "約" + y.toLocaleString() + "円"; };
+                    const usdNote = (n, cur) => (toYen(n, cur) == null ? "" : `<br><small style="color:#888;">${usd(n)}</small>`);
                     const soldLink = `<a href="${escapeHtml(data.sold_url)}" target="_blank" rel="noopener" style="color:#38bdf8;">eBayで売れた価格を見る</a>`;
                     if (!s.count) {
                         box.innerHTML = (ebayMode === "jan"
@@ -2068,15 +2076,15 @@ def get_scanner_page():
                         <a href="${escapeHtml(i.url)}" target="_blank" rel="noopener">
                             <img src="${escapeHtml(i.image)}" loading="lazy" onerror="this.style.visibility='hidden'">
                             <span class="t">${escapeHtml(i.title)}<br><small style="color:#888;">${escapeHtml(i.condition || "")}${i.country ? " ・ " + escapeHtml(i.country) + "から" : ""}${(i.buying_options || []).includes("AUCTION") ? " ・ オークション" : ""}</small></span>
-                            <span class="p">${usd(i.price)}${i.shipping != null ? `<br><small style="color:#aaa;">送料 ${usd(i.shipping)}</small>` : ""}</span>
+                            <span class="p">${yenText(i.price, i.currency)}${usdNote(i.price, i.currency)}${i.shipping != null ? `<br><small style="color:#aaa;">送料 ${yenText(i.shipping, i.currency)}</small>` : ""}</span>
                         </a>`).join("");
                     box.innerHTML = `
                         <div class="mercari-stats">
-                            <div><small>最安</small><b>${usd(s.min)}</b></div>
-                            <div><small>中央値</small><b>${usd(s.median)}</b></div>
-                            <div><small>最高</small><b>${usd(s.max)}</b></div>
+                            <div><small>最安</small><b>${yenText(s.min)}</b>${usdNote(s.min)}</div>
+                            <div><small>中央値</small><b>${yenText(s.median)}</b>${usdNote(s.median)}</div>
+                            <div><small>最高</small><b>${yenText(s.max)}</b>${usdNote(s.max)}</div>
                         </div>
-                        <div style="font-size:10px; color:#888; margin-bottom:4px;">出品中 ${s.count}件（送料別・${escapeHtml(s.currency)}） ・ ${soldLink}</div>
+                        <div style="font-size:10px; color:#888; margin-bottom:4px;">出品中 ${s.count}件（送料別${fx && s.currency !== "JPY" ? `・1${escapeHtml(s.currency)}=${fx.rate.toFixed(2)}円（${escapeHtml(fx.date)}）で換算` : "・" + escapeHtml(s.currency)}） ・ ${soldLink}</div>
                         <div class="mercari-list">${list}</div>`;
                 } catch (e) {
                     if (reqId !== ebayReqId) return;
