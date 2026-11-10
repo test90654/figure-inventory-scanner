@@ -1466,6 +1466,7 @@ def get_scanner_page():
             .item-location.none { background: #555; color: #ddd; }
             .btn-stock-export { background: #f1c40f; color: #000; }
             .btn-stock-csv { background: #555; color: #fff; }
+            .btn-stock-line { background: #06c755; color: #fff; }
             body.mode-stock .result-banner { background: #3a3110; border-color: #f1c40f; color: #fff3cd; }
 
             /* ===== PC表示: 2カラム + 全体を拡大（スマホ表示は変更なし） ===== */
@@ -1567,6 +1568,7 @@ def get_scanner_page():
             <div id="stock-filter-totals" class="stock-price-totals" style="display:none;" aria-live="polite"></div>
             <div id="stock-items"><p style="color: #777; text-align: center; margin: 8px 0;">読み込み中...</p></div>
 
+            <button class="btn btn-stock-line" onclick="shareStockToLine()">💬 在庫リストをLINEで送る</button>
             <button class="btn btn-stock-export" onclick="exportStockText()">📋 在庫リストをテキストでコピー</button>
             <button class="btn btn-stock-csv" onclick="downloadStockCsv()">⬇️ 在庫をCSVでダウンロード</button>
             <div style="font-size: 10px; color: #888; margin-top: 6px;">※ 在庫はサーバーに保存され、スプレッドシートの「保管在庫」シートにも自動で書き出されます。</div>
@@ -2812,14 +2814,13 @@ def get_scanner_page():
                 }
             });
 
-            window.exportStockText = function() {
-                if (stockItems.length === 0) return alert("在庫が空です。");
+            function buildStockText(items, heading = "【 保管在庫リスト 】") {
                 const groups = {};
-                stockItems.forEach(s => {
+                items.forEach(s => {
                     const key = s.location || "場所未設定";
                     (groups[key] = groups[key] || []).push(s);
                 });
-                let lines = ["【 保管在庫リスト 】"];
+                let lines = [heading];
                 let total = 0;
                 Object.keys(groups).forEach(loc => {
                     lines.push("");
@@ -2830,8 +2831,44 @@ def get_scanner_page():
                     });
                 });
                 lines.push("");
-                lines.push(`合計: ${stockItems.length}種 / ${total}点`);
-                navigator.clipboard.writeText(lines.join("\n")).then(() => alert("在庫リストをコピーしました！"));
+                lines.push(`合計: ${items.length}種 / ${total}点`);
+                return lines.join("\n");
+            }
+
+            window.exportStockText = function() {
+                if (stockItems.length === 0) return alert("在庫が空です。");
+                navigator.clipboard.writeText(buildStockText(stockItems)).then(() => alert("在庫リストをコピーしました！"));
+            }
+
+            // LINEの1メッセージ上限は5000文字。共有URLも長すぎると開けないため余裕を持たせる
+            const LINE_TEXT_LIMIT = 4500;
+            const LINE_URL_LIMIT = 8000;
+
+            function lineShareUrl(text) {
+                const url = "https://line.me/R/share?text=" + encodeURIComponent(text);
+                return (text.length <= LINE_TEXT_LIMIT && url.length <= LINE_URL_LIMIT) ? url : null;
+            }
+
+            window.shareStockToLine = function() {
+                if (stockItems.length === 0) return alert("在庫が空です。");
+                const filtering = document.getElementById("stock-filter").value.trim().length > 0
+                    || document.getElementById("stock-quote-filter").value !== "all";
+                const items = filtering ? getFilteredStock() : stockItems;
+                if (items.length === 0) return alert("絞り込み結果に在庫がありません。");
+                const d = new Date();
+                const stamp = `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+                const heading = `【 保管在庫リスト${filtering ? "（絞り込み）" : ""} 】${stamp}`;
+                const text = buildStockText(items, heading);
+                const url = lineShareUrl(text);
+                if (url) {
+                    window.open(url, "_blank");
+                    return;
+                }
+                // 長すぎてURLで渡せない場合はコピーして手で貼ってもらう
+                navigator.clipboard.writeText(text).then(
+                    () => alert(`在庫リストが長すぎてLINEに直接渡せないため、クリップボードにコピーしました（${items.length}種）。\nLINEのトークに貼り付けてください。\n※保管場所などで絞り込むと直接送れます。`),
+                    () => alert("在庫リストが長すぎてLINEに直接渡せません。保管場所などで絞り込んでから送ってください。")
+                );
             }
 
             window.downloadStockCsv = function() {
