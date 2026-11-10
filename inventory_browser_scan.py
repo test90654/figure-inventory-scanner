@@ -1466,7 +1466,8 @@ def get_scanner_page():
             .item-location.none { background: #555; color: #ddd; }
             .btn-stock-export { background: #f1c40f; color: #000; }
             .btn-stock-csv { background: #555; color: #fff; }
-            .btn-stock-line { background: #06c755; color: #fff; }
+            .summary-actions { display: flex; gap: 6px; align-items: center; }
+            .btn-line-top { background: #06c755; color: #fff; border: none; font-size: 12px; font-weight: bold; padding: 5px 10px; border-radius: 4px; cursor: pointer; white-space: nowrap; }
             body.mode-stock .result-banner { background: #3a3110; border-color: #f1c40f; color: #fff3cd; }
 
             /* ===== PC表示: 2カラム + 全体を拡大（スマホ表示は変更なし） ===== */
@@ -1559,7 +1560,10 @@ def get_scanner_page():
         <div id="stock-section" class="list-section" style="display:none;">
             <div class="summary-box">
                 <div>在庫: <strong id="stock-kinds" style="color:#f1c40f; font-size:18px;">0</strong> 種 / <strong id="stock-total" style="color:#f1c40f; font-size:18px;">0</strong> 点</div>
-                <button class="btn-clear" onclick="loadStock()">🔄 再読込</button>
+                <div class="summary-actions">
+                    <button class="btn-line-top" onclick="shareStockToLine()">💬 LINEで送る</button>
+                    <button class="btn-clear" onclick="loadStock()">🔄 再読込</button>
+                </div>
             </div>
             <div id="stock-price-totals" class="stock-price-totals" aria-live="polite"></div>
             <h3><span>🗄️ 保管在庫一覧</span></h3>
@@ -1568,7 +1572,6 @@ def get_scanner_page():
             <div id="stock-filter-totals" class="stock-price-totals" style="display:none;" aria-live="polite"></div>
             <div id="stock-items"><p style="color: #777; text-align: center; margin: 8px 0;">読み込み中...</p></div>
 
-            <button class="btn btn-stock-line" onclick="shareStockToLine()">💬 在庫リストをLINEで送る</button>
             <button class="btn btn-stock-export" onclick="exportStockText()">📋 在庫リストをテキストでコピー</button>
             <button class="btn btn-stock-csv" onclick="downloadStockCsv()">⬇️ 在庫をCSVでダウンロード</button>
             <div style="font-size: 10px; color: #888; margin-top: 6px;">※ 在庫はサーバーに保存され、スプレッドシートの「保管在庫」シートにも自動で書き出されます。</div>
